@@ -111,6 +111,52 @@ private func facesScreen(yaw: Double?, pitch: Double?, bothEyesVisible: Bool) ->
     return yaw != nil || pitch != nil || bothEyesVisible
 }
 
+private struct Torso {
+    let left: CGPoint
+    let right: CGPoint
+
+    init(left: CGPoint, right: CGPoint) {
+        self.left = left
+        self.right = right
+    }
+
+    init?(_ pose: VNHumanBodyPoseObservation) {
+        guard let left = try? pose.recognizedPoint(.leftShoulder), left.confidence >= 0.2,
+              let right = try? pose.recognizedPoint(.rightShoulder), right.confidence >= 0.2 else { return nil }
+        self.init(left: left.location, right: right.location)
+    }
+
+    var span: CGFloat { abs(left.x - right.x) }
+    var order: Int { left.x > right.x ? 1 : -1 }
+    var centerX: CGFloat { (left.x + right.x) / 2 }
+    var crop: CGRect {
+        CGRect(x: min(left.x, right.x) - span * 0.25,
+               y: min(left.y, right.y) - span * 1.2,
+               width: span * 1.5, height: span * 1.65)
+    }
+
+    func containsFace(_ box: CGRect) -> Bool {
+        abs(box.midX - centerX) <= span * 0.8 && box.midY >= min(left.y, right.y) - 0.08
+    }
+
+    func isCloseAndFront(order expectedOrder: Int, minSpan: CGFloat) -> Bool {
+        span >= minSpan && abs(left.y - right.y) <= span * 0.4 &&
+            (expectedOrder == 0 || order == expectedOrder)
+    }
+}
+
+private func bodyProximityThreshold() -> CGFloat {
+    CGFloat(min(0.4, max(0.14, UserDefaults.standard.object(forKey: "bodyProximityThreshold") as? Double ?? 0.22)))
+}
+
+private func broadUpperBody(_ box: CGRect, confidence: Float, minSpan: CGFloat) -> Bool {
+    confidence >= 0.6 && box.width >= max(0.42, minSpan * 1.8) && box.height >= 0.52
+}
+
+private func lowerBodyCrop(_ box: CGRect) -> CGRect {
+    CGRect(x: box.minX, y: box.minY, width: box.width, height: box.height * 0.65)
+}
+
 private func subtract(_ source: CGRect, by obstacle: CGRect) -> [CGRect] {
     let overlap = source.intersection(obstacle)
     if overlap.isNull { return [source] }
@@ -200,6 +246,7 @@ private final class Mask: NSObject {
     var contentOnly = false
     var topInset: CGFloat = 40
     var customRegion: CGRect?
+    var controlFrame: CGRect { customRegion == nil ? anchorFrame ?? panel.frame : panel.frame }
     var editing = false
     var clickThrough = true { didSet { panel.ignoresMouseEvents = clickThrough && !editing } }
     var visibleRects: [CGRect]? {
@@ -302,10 +349,17 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private var pendingEnrollment = false
     private var enrollmentRequested = false
     private var lastAnalysis: CFTimeInterval = 0
+    private var lastBodyAnalysis: CFTimeInterval = 0
+    private var lastBodyCount = 0
     private var threatLatch = ThreatLatch()
     private var ownerPrint: VNFeaturePrintObservation?
     private var ownerAppearancePrint: VNFeaturePrintObservation?
+    private var ownerTorsoPrint: VNFeaturePrintObservation?
+    private var ownerHumanPrint: VNFeaturePrintObservation?
     private var lastAppearanceUpdate: CFTimeInterval = 0
+    private var lastOwnerTorsoUpdate: CFTimeInterval = 0
+    private var lastOwnerHumanUpdate: CFTimeInterval = 0
+    private var ownerShoulderOrder = UserDefaults.standard.integer(forKey: "ownerShoulderOrder")
 
     private(set) var isEnabled = false
     private(set) var hasOwner: Bool
@@ -315,11 +369,22 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     var onEnrollment: ((Bool) -> Void)?
 
     override init() {
-        let stored = CommandLine.arguments.contains("--self-test") ? nil : OwnerFaceStore.load()
-        ownerPrint = stored
-        hasOwner = stored != nil
-        status = stored == nil ? "본인 미등록" : "본인 등록됨 · 꺼짐"
+        hasOwner = false
+        status = CommandLine.arguments.contains("--self-test") ? "본인 미등록" : "본인 정보 확인 중"
         super.init()
+    }
+
+    func loadOwner() {
+        guard !CommandLine.arguments.contains("--self-test") else { return }
+        analysisQueue.async { [weak self] in
+            guard let self else { return }
+            let stored = OwnerFaceStore.load()
+            self.ownerPrint = stored
+            DispatchQueue.main.async {
+                self.hasOwner = stored != nil
+                self.updateStatus(stored == nil ? "본인 미등록" : "본인 등록됨 · 꺼짐")
+            }
+        }
     }
 
     func start() {
@@ -350,6 +415,10 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.enrollmentRequested = false
             self.threatLatch = ThreatLatch()
             self.ownerAppearancePrint = nil
+            self.ownerTorsoPrint = nil
+            self.ownerHumanPrint = nil
+            self.lastBodyAnalysis = 0
+            self.lastBodyCount = 0
             if self.session.isRunning { self.session.stopRunning() }
         }
     }
@@ -372,7 +441,11 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             analysisQueue.async { [weak self] in
                 self?.ownerPrint = nil
                 self?.ownerAppearancePrint = nil
+                self?.ownerTorsoPrint = nil
+                self?.ownerHumanPrint = nil
+                self?.ownerShoulderOrder = 0
             }
+            UserDefaults.standard.removeObject(forKey: "ownerShoulderOrder")
         }
         return cleared
     }
@@ -445,9 +518,18 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         guard now - lastAnalysis >= 0.25,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastAnalysis = now
-        let request = VNDetectFaceLandmarksRequest()
-        guard (try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform([request])) != nil else { return }
-        let faces = request.results ?? []
+        let faceRequest = VNDetectFaceLandmarksRequest()
+        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        let humanRequest = VNDetectHumanRectanglesRequest()
+        humanRequest.upperBodyOnly = true
+        let analyzeBodies = now - lastBodyAnalysis >= 0.5
+        let requests: [VNRequest] = analyzeBodies ? [faceRequest, bodyRequest, humanRequest] : [faceRequest]
+        guard (try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform(requests)) != nil else { return }
+        if analyzeBodies {
+            lastBodyAnalysis = now
+            lastBodyCount = humanRequest.results?.count ?? 0
+        }
+        let faces = faceRequest.results ?? []
 
         if enrollmentRequested {
             guard faces.count == 1, isFacing(faces[0]),
@@ -465,6 +547,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             if saved {
                 ownerPrint = print
                 ownerAppearancePrint = appearancePrint(for: faces[0], in: pixelBuffer)
+                ownerTorsoPrint = nil
+                ownerHumanPrint = nil
             }
             DispatchQueue.main.async {
                 self.hasOwner = saved
@@ -476,9 +560,9 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
 
         var facingBoost: CGFloat = 0
         var presenceBoost: CGFloat = 0
+        var ownerIndex: Int?
         if let ownerPrint, !faces.isEmpty {
             var bestDistance = Float.greatestFiniteMagnitude
-            var ownerIndex: Int?
             let tolerance = ownerTolerance()
             for (index, face) in faces.enumerated() {
                 guard let print = featurePrint(for: face, in: pixelBuffer) else { continue }
@@ -508,13 +592,78 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             facingBoost = visitorBoost(observations, ownerIndex: ownerIndex)
             presenceBoost = visitorBoost(observations, ownerIndex: ownerIndex, requireFacing: false)
         }
+        if analyzeBodies, ownerPrint != nil {
+            let minSpan = bodyProximityThreshold()
+            let humans = humanRequest.results ?? []
+            var matchedHumans = Set<Int>()
+            for pose in bodyRequest.results ?? [] {
+                guard let torso = Torso(pose) else { continue }
+                guard let humanIndex = humans.indices.first(where: {
+                    humans[$0].confidence >= 0.55 && humans[$0].boundingBox.contains(
+                        CGPoint(x: torso.centerX, y: (torso.left.y + torso.right.y) / 2))
+                }) else { continue }
+                matchedHumans.insert(humanIndex)
+                let pairedFace = faces.indices.filter { torso.containsFace(faces[$0].boundingBox) }
+                    .min { abs(faces[$0].boundingBox.midX - torso.centerX) <
+                           abs(faces[$1].boundingBox.midX - torso.centerX) }
+                if let ownerIndex, pairedFace == ownerIndex {
+                    if isFacing(faces[ownerIndex]), torso.isCloseAndFront(order: 0, minSpan: 0.16) {
+                        ownerShoulderOrder = torso.order
+                        UserDefaults.standard.set(torso.order, forKey: "ownerShoulderOrder")
+                        if now - lastOwnerTorsoUpdate >= 4 {
+                            ownerTorsoPrint = imagePrint(for: torso.crop, in: pixelBuffer)
+                            lastOwnerTorsoUpdate = now
+                        }
+                    }
+                    if now - lastOwnerHumanUpdate >= 4 {
+                        ownerHumanPrint = imagePrint(for: lowerBodyCrop(humans[humanIndex].boundingBox), in: pixelBuffer)
+                        lastOwnerHumanUpdate = now
+                    }
+                    continue
+                }
+                guard torso.span >= minSpan * 0.65 else { continue }
+                if pairedFace == nil, let ownerTorsoPrint,
+                   let print = imagePrint(for: torso.crop, in: pixelBuffer) {
+                    var distance: Float = 0
+                    if (try? print.computeDistance(&distance, to: ownerTorsoPrint)) != nil,
+                       distance <= ownerTolerance() * 0.7 { continue }
+                }
+                presenceBoost = 1
+                if torso.isCloseAndFront(order: ownerShoulderOrder, minSpan: minSpan) { facingBoost = 1 }
+            }
+            // ponytail: A broad upper-body box cannot separate front from back; use a body orientation model if false triggers matter.
+            for (index, human) in humans.enumerated() where !matchedHumans.contains(index) {
+                let box = human.boundingBox
+                guard broadUpperBody(box, confidence: human.confidence, minSpan: minSpan) else { continue }
+                let pairedFace = faces.indices.filter { box.contains(CGPoint(x: faces[$0].boundingBox.midX,
+                                                                              y: faces[$0].boundingBox.midY)) }
+                    .min { abs(faces[$0].boundingBox.midX - box.midX) <
+                           abs(faces[$1].boundingBox.midX - box.midX) }
+                if let ownerIndex, pairedFace == ownerIndex {
+                    if now - lastOwnerHumanUpdate >= 4 {
+                        ownerHumanPrint = imagePrint(for: lowerBodyCrop(box), in: pixelBuffer)
+                        lastOwnerHumanUpdate = now
+                    }
+                    continue
+                }
+                if pairedFace == nil, let ownerHumanPrint,
+                   let print = imagePrint(for: lowerBodyCrop(box), in: pixelBuffer) {
+                    var distance: Float = 0
+                    if (try? print.computeDistance(&distance, to: ownerHumanPrint)) != nil,
+                       distance <= ownerTolerance() * 0.7 { continue }
+                }
+                presenceBoost = 1
+                facingBoost = 1
+            }
+        }
         let target = threatLatch.update(facing: facingBoost, present: presenceBoost, now: now)
         let boost = target
         let faceCount = faces.count
+        let bodyCount = lastBodyCount
         DispatchQueue.main.async {
             self.onBoost?(boost)
-            self.updateStatus(boost > 0.1 ? "다른 얼굴 감지 · 가리개 강화" :
-                              self.hasOwner ? "카메라 감지 중 · 얼굴 \(faceCount)명" : "본인 등록이 필요합니다")
+            self.updateStatus(boost > 0.1 ? "다른 사람 감지 · 가리개 강화" :
+                              self.hasOwner ? "카메라 감지 중 · 얼굴 \(faceCount)명 · 몸 \(bodyCount)명" : "본인 등록이 필요합니다")
         }
     }
 
@@ -720,6 +869,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.informativeText = success ? "얼굴 특징만 이 Mac의 키체인에 보관합니다. 메뉴에서 언제든 다시 지정하거나 삭제할 수 있습니다." : "잠시 후 다시 시도해 주세요."
             alert.runModal()
         }
+        cameraGuard.loadOwner()
 
         let mirror = Mask(target: .mirror, name: "아이폰 미러링")
         mirror.contentOnly = true
@@ -813,9 +963,9 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard !hidden, mask.enabled, mask.panel.isVisible, !mask.editing else { handle.hide(); continue }
             if bar.mask === mask && bar.panel.isVisible {
                 handle.hide()
-                bar.show(mask, frame: mask.anchorFrame ?? mask.panel.frame)
+                bar.show(mask, frame: mask.controlFrame)
             } else {
-                handle.place(near: mask.anchorFrame ?? mask.panel.frame)
+                handle.place(near: mask.controlFrame)
             }
         }
         if let mask = bar.mask, hidden || !mask.enabled || !mask.panel.isVisible { bar.hide() }
@@ -823,7 +973,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func toggleBar(for mask: Mask) {
         if bar.mask === mask && bar.panel.isVisible { bar.hide() }
-        else { bar.show(mask, frame: mask.anchorFrame ?? mask.panel.frame) }
+        else { bar.show(mask, frame: mask.controlFrame) }
         refreshControls()
     }
 
@@ -862,6 +1012,8 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cameraMenu.addItem(disabledLabel("반응할 가리개 \(masks.filter(\.cameraTrackingEnabled).count)개"))
         cameraMenu.addItem(disabledLabel("본인 판별 기준 · 낮을수록 엄격"))
         cameraMenu.addItem(sliderItem(Double(ownerTolerance()), 0.55, 1.25, 0, #selector(changeOwnerTolerance(_:))))
+        cameraMenu.addItem(disabledLabel("몸 감지 거리 · 왼쪽일수록 멀리"))
+        cameraMenu.addItem(sliderItem(Double(bodyProximityThreshold()), 0.14, 0.4, 0, #selector(changeBodyProximity(_:))))
         cameraMenu.addItem(.separator())
         cameraMenu.addItem(item(cameraGuard.hasOwner ? "나로 다시 지정…" : "나로 지정…", #selector(enrollOwner)))
         if cameraGuard.hasOwner { cameraMenu.addItem(item("본인 등록 정보 삭제…", #selector(resetOwner))) }
@@ -1110,6 +1262,9 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func changeOwnerTolerance(_ slider: NSSlider) {
         UserDefaults.standard.set(slider.doubleValue, forKey: "ownerTolerance")
     }
+    @objc private func changeBodyProximity(_ slider: NSSlider) {
+        UserDefaults.standard.set(slider.doubleValue, forKey: "bodyProximityThreshold")
+    }
     @objc private func enrollOwner() {
         let alert = NSAlert()
         alert.messageText = "본인 얼굴 지정"
@@ -1221,12 +1376,27 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(facesScreen(yaw: 0.1, pitch: 0.2, bothEyesVisible: true))
     precondition(!facesScreen(yaw: 0.9, pitch: 0, bothEyesVisible: true))
     precondition(!facesScreen(yaw: nil, pitch: nil, bothEyesVisible: false))
+    let frontTorso = Torso(left: CGPoint(x: 0.68, y: 0.55), right: CGPoint(x: 0.32, y: 0.54))
+    precondition(frontTorso.isCloseAndFront(order: 1, minSpan: 0.22))
+    precondition(frontTorso.containsFace(CGRect(x: 0.45, y: 0.6, width: 0.1, height: 0.15)))
+    precondition(!frontTorso.containsFace(CGRect(x: 0.8, y: 0.6, width: 0.1, height: 0.15)))
+    precondition(!frontTorso.isCloseAndFront(order: -1, minSpan: 0.22))
+    precondition(!Torso(left: CGPoint(x: 0.52, y: 0.55), right: CGPoint(x: 0.43, y: 0.54))
+        .isCloseAndFront(order: 1, minSpan: 0.22))
+    precondition(!Torso(left: CGPoint(x: 0.68, y: 0.75), right: CGPoint(x: 0.32, y: 0.45))
+        .isCloseAndFront(order: 1, minSpan: 0.22))
+    precondition(broadUpperBody(CGRect(x: 0.14, y: 0, width: 0.72, height: 0.99), confidence: 0.71, minSpan: 0.22))
+    precondition(!broadUpperBody(CGRect(x: 0.3, y: 0.2, width: 0.25, height: 0.5), confidence: 0.8, minSpan: 0.22))
+    precondition(!broadUpperBody(CGRect(x: 0.14, y: 0, width: 0.72, height: 0.99), confidence: 0.2, minSpan: 0.22))
     let regionMask = Mask(target: .window(1), name: "영역 검사", frame: CGRect(x: 100, y: 200, width: 200, height: 150))
     regionMask.setEditing(true)
     let movedContent = CGRect(x: 135, y: 235, width: 80, height: 60)
     regionMask.panel.setFrame(regionMask.panel.frameRect(forContentRect: movedContent), display: true)
     regionMask.setEditing(false)
     precondition(regionMask.panel.frame == movedContent)
+    regionMask.anchorFrame = CGRect(x: 100, y: 200, width: 400, height: 300)
+    regionMask.customRegion = CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2)
+    precondition(regionMask.controlFrame == movedContent)
     regionMask.panel.orderOut(nil)
     let left = subtract(CGRect(x: 0, y: 0, width: 100, height: 100),
                         by: CGRect(x: 25, y: 25, width: 50, height: 50))
