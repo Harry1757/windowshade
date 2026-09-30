@@ -209,31 +209,31 @@ private func isFist(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
     fingers.filter { $0.base > 0.02 && $0.tip <= $0.base * 1.25 }.count >= 3
 }
 
-private func isOpenHand(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
-    fingers.filter { $0.base > 0.02 && $0.tip >= $0.base * 1.6 }.count >= 3
-}
+// 같은 손 모양을 1초 이상 보이면 true를 한 번 돌려준다. 모양을 바꿨다가 다시 해야 또 반응한다.
+private struct HandHold {
+    private var start: CFTimeInterval?
+    private var fired = false
+    private var lastFist: CFTimeInterval = -100
+    var progress: Double = 0
 
-// 손바닥 → 주먹을 3초 안에 두 번 하면 true를 한 번 돌려준다.
-private struct ClenchToggle {
-    private var last: Bool?
-    private var lastSeen: CFTimeInterval = 0
-    private var clenches: [CFTimeInterval] = []
-    var progress: Int { clenches.count }
-
-    mutating func update(fist: Bool?, now: CFTimeInterval) -> Bool {
-        clenches.removeAll { now - $0 > 3 }
-        guard let fist else {
-            if now - lastSeen > 1.5 { last = nil }
+    mutating func update(fist: Bool, now: CFTimeInterval) -> Bool {
+        if fist {
+            lastFist = now
+            if start == nil { start = now }
+        } else if now - lastFist > 0.4 {
+            start = nil; fired = false; progress = 0
             return false
         }
-        lastSeen = now
-        defer { last = fist }
-        guard fist, last == false else { return false }
-        clenches.append(now)
-        guard clenches.count >= 2 else { return false }
-        clenches.removeAll()
+        guard let start else { return false }
+        progress = min(1, (now - start) / 1.0)
+        guard !fired, now - start >= 1.0 else { return false }
+        fired = true
         return true
     }
+}
+
+private func isOpenHand(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
+    fingers.filter { $0.base > 0.02 && $0.tip >= $0.base * 1.6 }.count >= 3
 }
 
 private struct Torso {
@@ -656,7 +656,7 @@ private struct CameraDebug {
     var faces: [Face]
     var bodies: [Body]
     var hands: [Hand]
-    var gestureProgress: Int
+    var gestureProgress: Double
     var boost: CGFloat
     var reason: String
 }
@@ -667,7 +667,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     var onDebug: ((CameraDebug) -> Void)?
     var onGesture: (() -> Void)?
     var manualBlack = false
-    private var clench = ClenchToggle()
+    private var fistHold = HandHold()
+    private var palmHold = HandHold()
     private var ownerTrack = OwnerTrack()
     private var lastBodies: [CameraDebug.Body] = []
     private let analysisQueue = DispatchQueue(label: "local.windowshade.camera", qos: .userInitiated)
@@ -747,7 +748,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.enrollmentRequested = false
             self.threatLatch = ThreatLatch()
             self.visitorWatch = VisitorWatch()
-            self.clench = ClenchToggle()
+            self.fistHold = HandHold()
+            self.palmHold = HandHold()
             self.ownerTrack = OwnerTrack()
             self.ownerAppearancePrint = nil
             self.ownerTorsoPrint = nil
@@ -1031,7 +1033,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let target = threatLatch.update(facing: facingBoost, present: presenceBoost, now: now)
         let boost = target
         var hands: [CameraDebug.Hand] = []
-        var toggled = false
+        var gestureSet: Bool?
         if gestureOn {
             let tips: [VNHumanHandPoseObservation.JointName] = [.indexTip, .middleTip, .ringTip, .littleTip]
             let bases: [VNHumanHandPoseObservation.JointName] = [.indexMCP, .middleMCP, .ringMCP, .littleMCP]
@@ -1049,15 +1051,17 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 let state: Bool? = fingers.count < 3 ? nil : isFist(fingers) ? true : isOpenHand(fingers) ? false : nil
                 hands.append(.init(point: wrist.location, fist: state))
             }
-            toggled = clench.update(fist: hands.first(where: { $0.fist != nil })?.fist, now: now)
+            if fistHold.update(fist: hands.contains { $0.fist == true }, now: now) { gestureSet = true }
+            if palmHold.update(fist: hands.contains { $0.fist == false }, now: now) { gestureSet = false }
         }
-        if toggled {
+        if let gestureSet {
             DispatchQueue.main.async {
-                self.manualBlack.toggle()
+                guard self.manualBlack != gestureSet else { return }
+                self.manualBlack = gestureSet
                 self.onGesture?()
             }
         }
-        let gestureProgress = clench.progress
+        let gestureProgress = max(fistHold.progress, palmHold.progress)
         let faceCount = faces.count
         let bodyCount = lastBodyCount
         if let onDebug {
@@ -1239,7 +1243,7 @@ private final class CameraOverlay: NSView {
             NSColor.systemBlue.setFill()
             NSBezierPath(ovalIn: NSRect(x: center.x - 11, y: center.y - 11, width: 22, height: 22)).fill()
             let state = hand.fist == true ? "✊ 주먹" : hand.fist == false ? "✋ 손바닥" : "내 손"
-            let progress = debug.gestureProgress > 0 ? " · \(debug.gestureProgress)/2" : ""
+            let progress = hand.fist != nil && debug.gestureProgress < 1 ? String(format: " · %.1f초", debug.gestureProgress) : ""
             label(state + progress, at: NSPoint(x: center.x - 30, y: center.y + 16), color: .systemBlue)
         }
         // 얼굴 없이 몸만 보이는 다른 사람만 표시한다. 내 몸과 얼굴이 보이는 사람은 네모로 충분하다.
@@ -1299,7 +1303,7 @@ private final class CameraPreviewPanel: NSPanel, NSWindowDelegate {
         caption(bodyTitle, "이 거리 안(빨간 쪽)에 들어온 다른 사람에게만 반응합니다", y: y); y += 40
         faceMeter.frame.origin.y = y; content.addSubview(faceMeter); y += 96
         caption(faceTitle, "왼쪽 = 엄격히(낯선 얼굴을 잘 가림) · 오른쪽 = 완만히(웬만하면 나로 인정)", y: y); y += 42
-        let legend = NSTextField(wrappingLabelWithString: "네모 = 얼굴 · 초록 나 · 빨강 가림 대상 · 주황 딴 곳 봄 · 회색 멀어서 무시\n이름표만 있는 것 = 얼굴 없이 몸만 보이는 사람\n파랑 = 내 손 · 손바닥↔주먹 2번 = 검게 가리기, 한 번 더 = 다시 보이기")
+        let legend = NSTextField(wrappingLabelWithString: "네모 = 얼굴 · 초록 나 · 빨강 가림 대상 · 주황 딴 곳 봄 · 회색 멀어서 무시\n이름표만 있는 것 = 얼굴 없이 몸만 보이는 사람\n파랑 = 내 손 · 주먹 1초 = 검게 가리기 · 손바닥 1초 = 다시 보이기")
         legend.font = .systemFont(ofSize: 11)
         legend.textColor = .secondaryLabelColor
         legend.frame = NSRect(x: 20, y: y, width: 480, height: 48)
@@ -1391,7 +1395,7 @@ private final class CameraPreviewPanel: NSPanel, NSWindowDelegate {
              ($0.owner ? "나" : "남") + String(format: " %.1fm", $0.meters))
         }
         if !camera.hasOwner { show("본인이 등록되지 않았습니다 — ◐ → 카메라 트래킹 → 나로 지정…", .systemOrange) }
-        else if camera.manualBlack { show("✊ 손 신호로 검게 가림 — 손바닥↔주먹 2번 더 하면 다시 보임", .systemBlue) }
+        else if camera.manualBlack { show("✊ 손 신호로 검게 가림 — 손바닥을 1초 보이면 다시 보임", .systemBlue) }
         else if debug.boost > 0.1 {
             show("가려짐 — " + (debug.reason.isEmpty ? "방금 감지된 사람 때문에 잠시 유지" : debug.reason), .systemRed)
         } else if debug.faces.isEmpty { show("얼굴이 보이지 않습니다", .secondaryLabelColor) }
@@ -1729,7 +1733,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cameraMenu.addItem(disabledLabel(cameraGuard.status))
         cameraMenu.addItem(disabledLabel("반응할 가리개 \(masks.filter(\.cameraTrackingEnabled).count)개"))
         cameraMenu.addItem(item("미리보기로 보며 조절…", #selector(openCameraPreview)))
-        let gesture = item("✋ 손바닥↔주먹 2번으로 검게 가리기", #selector(toggleHandGesture))
+        let gesture = item("✊ 주먹 1초 가리기 · ✋ 손바닥 1초 풀기", #selector(toggleHandGesture))
         gesture.state = UserDefaults.standard.bool(forKey: "handGestureOff") ? .off : .on
         cameraMenu.addItem(gesture)
         cameraMenu.addItem(disabledLabel("① 본인 인식 기준 · 왼쪽=엄격"))
@@ -2223,16 +2227,15 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!isFist([(0.05, 0.08), (0.2, 0.09), (0.19, 0.09), (0.17, 0.08)]))
     precondition(isOpenHand([(0.18, 0.08), (0.2, 0.09), (0.19, 0.09), (0.17, 0.08)]))
     precondition(!isOpenHand([(0.05, 0.08), (0.06, 0.09), (0.05, 0.09), (0.07, 0.08)]))
-    var clench = ClenchToggle()
-    precondition(!clench.update(fist: false, now: 0) && !clench.update(fist: true, now: 0.4) && clench.progress == 1)
-    precondition(!clench.update(fist: nil, now: 0.6) && !clench.update(fist: false, now: 0.8))
-    precondition(clench.update(fist: true, now: 1.2) && clench.progress == 0)
-    precondition(!clench.update(fist: true, now: 1.4))
-    var slow = ClenchToggle()
-    _ = slow.update(fist: false, now: 0); _ = slow.update(fist: true, now: 0.4); _ = slow.update(fist: false, now: 3.0)
-    precondition(!slow.update(fist: true, now: 3.6))
-    var fistOnly = ClenchToggle()
-    precondition(!fistOnly.update(fist: true, now: 0) && !fistOnly.update(fist: true, now: 0.5) && fistOnly.progress == 0)
+    var hold = HandHold()
+    precondition(!hold.update(fist: true, now: 0) && !hold.update(fist: true, now: 0.6))
+    precondition(!hold.update(fist: false, now: 0.8))
+    precondition(hold.update(fist: true, now: 1.05))
+    precondition(!hold.update(fist: true, now: 2.5))
+    precondition(!hold.update(fist: false, now: 3.0))
+    precondition(!hold.update(fist: true, now: 3.1) && hold.update(fist: true, now: 4.2))
+    var brief = HandHold()
+    precondition(!brief.update(fist: true, now: 0) && !brief.update(fist: false, now: 0.5) && !brief.update(fist: true, now: 1.2))
     precondition(sameFace(CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2), CGRect(x: 0.12, y: 0.12, width: 0.2, height: 0.2)))
     precondition(!sameFace(CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1), CGRect(x: 0.5, y: 0.5, width: 0.1, height: 0.1)))
     var watch = VisitorWatch()
@@ -2356,6 +2359,8 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
+
 
 
 
