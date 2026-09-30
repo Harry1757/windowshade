@@ -105,10 +105,39 @@ private struct ThreatLatch {
     }
 }
 
-private func facesScreen(yaw: Double?, pitch: Double?, bothEyesVisible: Bool) -> Bool {
-    if let yaw, abs(yaw) > 0.65 { return false }
+// 다른 사람에게는 더 넓은 각도(limit)를 적용해 곁눈질·고개 돌림도 잡는다.
+private func facesScreen(yaw: Double?, pitch: Double?, bothEyesVisible: Bool, limit: Double = 0.65) -> Bool {
+    if let yaw, abs(yaw) > limit { return false }
     if let pitch, abs(pitch) > 0.65 { return false }
     return yaw != nil || pitch != nil || bothEyesVisible
+}
+
+// 본인 얼굴이 잠깐 오인식돼도 직전 위치·크기와 이어지면 본인으로 본다.
+private func continuesOwner(box: CGRect, last: CGRect?, age: CFTimeInterval,
+                            distance: Float, tolerance: Float) -> Bool {
+    guard let last, age <= 1.5, distance <= tolerance + 0.25 else { return false }
+    let ratio = box.width / last.width
+    return hypot(box.midX - last.midX, box.midY - last.midY) < 0.12 && ratio > 0.7 && ratio < 1.4
+}
+
+// 다른 사람 얼굴이 1초 안에 커지거나(다가옴) 정면으로 돌아오면(고개 돌림) 경보.
+private struct VisitorWatch {
+    private var history: [(t: CFTimeInterval, box: CGRect, yaw: Double)] = []
+
+    mutating func alarm(_ faces: [(box: CGRect, yaw: Double?)], now: CFTimeInterval) -> Bool {
+        history.removeAll { now - $0.t > 1.0 }
+        var hit = false
+        for face in faces {
+            let yaw = abs(face.yaw ?? 0)
+            guard let old = history.first(where: {
+                hypot($0.box.midX - face.box.midX, $0.box.midY - face.box.midY) < 0.15 }) else { continue }
+            let grew = face.box.width >= 0.07 && face.box.width / old.box.width >= 1.2
+            let turning = yaw < 1.2 && old.yaw - yaw >= 0.25
+            if grew || turning { hit = true }
+        }
+        history += faces.map { (now, $0.box, abs($0.yaw ?? 0)) }
+        return hit
+    }
 }
 
 private struct Torso {
@@ -176,12 +205,48 @@ private func subtract(_ source: CGRect, by obstacle: CGRect) -> [CGRect] {
     return remaining
 }
 
+private struct Edges: OptionSet {
+    let rawValue: Int
+    static let left = Edges(rawValue: 1)
+    static let right = Edges(rawValue: 2)
+    static let top = Edges(rawValue: 4)
+    static let bottom = Edges(rawValue: 8)
+}
+
+private func editedFrame(_ start: CGRect, dx: CGFloat, dy: CGFloat, edges: Edges) -> CGRect {
+    var frame = start
+    if edges.isEmpty {
+        frame.origin.x += dx
+        frame.origin.y += dy
+        return frame
+    }
+    let minWidth: CGFloat = 120, minHeight: CGFloat = 60
+    if edges.contains(.left) {
+        let width = max(minWidth, start.width - dx)
+        frame.origin.x = start.minX + start.width - width
+        frame.size.width = width
+    }
+    if edges.contains(.right) { frame.size.width = max(minWidth, start.width + dx) }
+    if edges.contains(.bottom) {
+        let height = max(minHeight, start.height - dy)
+        frame.origin.y = start.minY + start.height - height
+        frame.size.height = height
+    }
+    if edges.contains(.top) { frame.size.height = max(minHeight, start.height + dy) }
+    return frame
+}
+
 private final class TintView: NSView {
     var color: NSColor = .black { didSet { needsDisplay = true } }
     var opacity: CGFloat = 0.35 { didSet { needsDisplay = true } }
     var spotlight = false { didSet { needsDisplay = true } }
     var spotlightRadius: CGFloat = 70 { didSet { needsDisplay = true } }
     var border = false { didSet { needsDisplay = true } }
+    var cornerRadius: CGFloat = 0 { didSet { needsDisplay = true } }
+    var editing = false { didSet { needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    var onEditFrameChange: (() -> Void)?
+    private var dragEdges: Edges = []
+    private var dragStart: (mouse: NSPoint, frame: NSRect)?
     var pointer: NSPoint = .zero {
         didSet {
             guard spotlight, abs(pointer.x - oldValue.x) + abs(pointer.y - oldValue.y) > 1 else { return }
@@ -197,12 +262,15 @@ private final class TintView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
+        if cornerRadius > 0 {
+            NSBezierPath(roundedRect: bounds, xRadius: cornerRadius, yRadius: cornerRadius).addClip()
+        }
         if let visibleRects {
             let clip = NSBezierPath()
             for rect in visibleRects { clip.appendRect(rect) }
             clip.addClip()
         }
-        color.withAlphaComponent(opacity).setFill()
+        color.withAlphaComponent(editing ? min(opacity, 0.3) : opacity).setFill()
         if spotlight && bounds.contains(pointer) {
             let path = NSBezierPath(rect: bounds)
             path.appendOval(in: NSRect(x: pointer.x - spotlightRadius, y: pointer.y - spotlightRadius,
@@ -214,15 +282,120 @@ private final class TintView: NSView {
         }
         if border {
             color.withAlphaComponent(0.8).setStroke()
-            let path = NSBezierPath(rect: bounds.insetBy(dx: 2, dy: 2))
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2),
+                                    xRadius: max(0, cornerRadius - 2), yRadius: max(0, cornerRadius - 2))
             path.lineWidth = 3
             path.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
+        if editing { drawEditingOverlay() }
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private func edges(at point: NSPoint) -> Edges {
+        let grab: CGFloat = 14
+        var result: Edges = []
+        if point.x <= grab { result.insert(.left) }
+        if point.x >= bounds.maxX - grab { result.insert(.right) }
+        if point.y <= grab { result.insert(.bottom) }
+        if point.y >= bounds.maxY - grab { result.insert(.top) }
+        return result
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard editing, let window else { return super.mouseDown(with: event) }
+        dragEdges = edges(at: convert(event.locationInWindow, from: nil))
+        dragStart = (NSEvent.mouseLocation, window.frame)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard editing, let window, let start = dragStart else { return }
+        let mouse = NSEvent.mouseLocation
+        window.setFrame(editedFrame(start.frame, dx: mouse.x - start.mouse.x, dy: mouse.y - start.mouse.y,
+                                    edges: dragEdges), display: true)
+        onEditFrameChange?()
+    }
+
+    override func resetCursorRects() {
+        guard editing else { return }
+        let grab: CGFloat = 14
+        let b = bounds
+        addCursorRect(b.insetBy(dx: grab, dy: grab), cursor: .openHand)
+        addCursorRect(NSRect(x: grab, y: 0, width: max(0, b.width - 2 * grab), height: grab), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: grab, y: b.maxY - grab, width: max(0, b.width - 2 * grab), height: grab), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: 0, y: grab, width: grab, height: max(0, b.height - 2 * grab)), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: b.maxX - grab, y: grab, width: grab, height: max(0, b.height - 2 * grab)), cursor: .resizeLeftRight)
+        let corners: [(CGFloat, CGFloat)] = [(0, 0), (b.maxX - grab, 0), (0, b.maxY - grab), (b.maxX - grab, b.maxY - grab)]
+        for (x, y) in corners { addCursorRect(NSRect(x: x, y: y, width: grab, height: grab), cursor: .crosshair) }
+    }
+
+    private func drawEditingOverlay() {
+        let accent = NSColor.systemBlue
+        accent.setStroke()
+        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5),
+                                   xRadius: max(0, cornerRadius - 1.5), yRadius: max(0, cornerRadius - 1.5))
+        outline.lineWidth = 3
+        outline.stroke()
+        let inset: CGFloat = 8
+        let xs = [bounds.minX + inset, bounds.midX, bounds.maxX - inset]
+        let ys = [bounds.minY + inset, bounds.midY, bounds.maxY - inset]
+        for (column, x) in xs.enumerated() {
+            for (row, y) in ys.enumerated() where !(column == 1 && row == 1) {
+                let dot = NSBezierPath(ovalIn: CGRect(x: x - 6, y: y - 6, width: 12, height: 12))
+                NSColor.white.setFill()
+                dot.fill()
+                dot.lineWidth = 2
+                dot.stroke()
+            }
+        }
+        guard bounds.width >= 280, bounds.height >= 90 else { return }
+        let hint = NSAttributedString(string: "끌어서 이동 · 가장자리를 당겨 크기 조절", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white])
+        let size = hint.size()
+        let pill = CGRect(x: bounds.midX - size.width / 2 - 14, y: bounds.midY - size.height / 2 - 7,
+                          width: size.width + 28, height: size.height + 14)
+        NSColor(calibratedWhite: 0, alpha: 0.7).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
+        hint.draw(at: CGPoint(x: pill.minX + 14, y: pill.minY + 7))
     }
 }
 
-private final class Mask: NSObject {
+private final class ChipButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+private func chip(_ title: String, symbol: String, fill: NSColor, tip: String,
+                  target: AnyObject, action: Selector) -> ChipButton {
+    let button = ChipButton()
+    button.isBordered = false
+    button.wantsLayer = true
+    button.layer?.cornerRadius = 8
+    button.layer?.backgroundColor = fill.cgColor
+    button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+        .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+    button.imagePosition = .imageLeading
+    button.imageHugsTitle = true
+    button.alignment = .center
+    button.contentTintColor = .white
+    button.attributedTitle = NSAttributedString(string: " " + title, attributes: [
+        .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.white])
+    button.toolTip = tip
+    button.target = target
+    button.action = action
+    return button
+}
+
+private final class EditPanel: NSPanel {
+    var onReturn: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 { onReturn?() }
+    }
+}
+
+private final class Mask: NSObject, NSWindowDelegate {
     enum Target {
         case mirror
         case window(Int)
@@ -232,6 +405,7 @@ private final class Mask: NSObject {
     let target: Target
     let panel: NSPanel
     let tint = TintView()
+    weak var owner: ShadeApp?
     var anchorFrame: CGRect?
     var controlOccluders: [CGRect] = []
     var name: String
@@ -243,6 +417,7 @@ private final class Mask: NSObject {
     var spotlight = false { didSet { tint.spotlight = spotlight } }
     var spotlightRadius: CGFloat = 70 { didSet { tint.spotlightRadius = spotlightRadius } }
     var border = false { didSet { tint.border = border } }
+    var cornerRadius: CGFloat = 0 { didSet { tint.cornerRadius = cornerRadius } }
     var contentOnly = false
     var topInset: CGFloat = 40
     var customRegion: CGRect?
@@ -259,7 +434,7 @@ private final class Mask: NSObject {
     init(target: Target, name: String, frame: CGRect = CGRect(x: 240, y: 240, width: 300, height: 220)) {
         self.target = target
         self.name = name
-        panel = NSPanel(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        panel = EditPanel(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         super.init()
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -269,11 +444,14 @@ private final class Mask: NSObject {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.level = .statusBar
         panel.ignoresMouseEvents = true
+        panel.delegate = self
         tint.opacity = opacity
         tint.spotlightRadius = spotlightRadius
         tint.frame = panel.contentView?.bounds ?? frame
         tint.autoresizingMask = [.width, .height]
         panel.contentView = tint
+        tint.onEditFrameChange = { [weak self] in self?.syncEditToolbar() }
+        (panel as? EditPanel)?.onReturn = { [weak self] in self?.finishEditing() }
     }
 
     private func updateOpacity() {
@@ -283,22 +461,58 @@ private final class Mask: NSObject {
 
     func setEditing(_ value: Bool) {
         guard editing != value else { return }
-        if value {
-            let contentFrame = panel.frame
-            panel.styleMask = [.titled, .resizable]
-            panel.setFrame(panel.frameRect(forContentRect: contentFrame), display: true)
-            panel.isMovableByWindowBackground = true
-            visibleRects = nil
-        } else {
-            let contentFrame = panel.contentRect(forFrameRect: panel.frame)
-            panel.styleMask = [.borderless]
-            panel.setFrame(contentFrame, display: true)
-            panel.isMovableByWindowBackground = false
-        }
         editing = value
-        panel.title = "가리개 위치·크기 조절 후 메뉴에서 완료"
+        tint.editing = value
+        if value { visibleRects = nil } else { editToolbar.orderOut(nil) }
         panel.ignoresMouseEvents = clickThrough && !value
         panel.orderFrontRegardless()
+        syncEditToolbar()
+    }
+
+    func syncEditToolbar() {
+        guard editing else { return }
+        guard panel.isVisible else { editToolbar.orderOut(nil); return }
+        let size = editToolbar.frame.size
+        let frame = panel.frame
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? frame
+        let x = min(max(frame.maxX - size.width, visible.minX + 4), visible.maxX - size.width - 4)
+        let y = frame.maxY + size.height + 8 <= visible.maxY ? frame.maxY + 8 : frame.maxY - size.height - 8
+        editToolbar.setFrameOrigin(CGPoint(x: x, y: y))
+        if !editToolbar.isVisible { editToolbar.orderFrontRegardless() }
+    }
+
+    private lazy var editToolbar: NSPanel = {
+        let toolbar = ControlPanel(contentRect: NSRect(x: 0, y: 0, width: 250, height: 30),
+                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        toolbar.level = .statusBar
+        toolbar.isOpaque = false
+        toolbar.backgroundColor = .clear
+        toolbar.hasShadow = false
+        toolbar.hidesOnDeactivate = false
+        toolbar.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 30))
+        let remove = chip("삭제", symbol: "trash", fill: NSColor.systemRed.withAlphaComponent(0.92),
+                          tip: "이 가리개 삭제", target: self, action: #selector(deleteSelf))
+        let settings = chip("설정", symbol: "gearshape", fill: NSColor(calibratedWhite: 0.16, alpha: 0.96),
+                            tip: "어둡기·색 등 설정", target: self, action: #selector(showSettings(_:)))
+        let done = chip("고정", symbol: "checkmark", fill: NSColor.systemGreen,
+                        tip: "이 영역으로 고정 (Return)", target: self, action: #selector(finishEditing))
+        remove.frame = NSRect(x: 4, y: 2, width: 66, height: 26)
+        settings.frame = NSRect(x: 100, y: 2, width: 66, height: 26)
+        done.frame = NSRect(x: 174, y: 2, width: 72, height: 26)
+        for button in [remove, settings, done] { view.addSubview(button) }
+        toolbar.contentView = view
+        return toolbar
+    }()
+
+    @objc private func deleteSelf() { owner?.deleteMask(self) }
+    @objc private func showSettings(_ sender: NSButton) { owner?.showSettings(for: self, at: sender) }
+    @objc private func finishEditing() { owner?.finishEditing(self) }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        owner?.deleteMask(self)
+        return false
     }
 }
 
@@ -352,6 +566,10 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private var lastBodyAnalysis: CFTimeInterval = 0
     private var lastBodyCount = 0
     private var threatLatch = ThreatLatch()
+    private var visitorWatch = VisitorWatch()
+    private var lastOwnerBox: CGRect?
+    private var lastOwnerSeen: CFTimeInterval = 0
+    private var approachAlarm = false
     private var ownerPrint: VNFeaturePrintObservation?
     private var ownerAppearancePrint: VNFeaturePrintObservation?
     private var ownerTorsoPrint: VNFeaturePrintObservation?
@@ -375,7 +593,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     }
 
     func loadOwner() {
-        guard !CommandLine.arguments.contains("--self-test") else { return }
+        guard !CommandLine.arguments.contains("--self-test"),
+              !CommandLine.arguments.contains("--no-keychain") else { return }
         analysisQueue.async { [weak self] in
             guard let self else { return }
             let stored = OwnerFaceStore.load()
@@ -414,6 +633,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
             guard let self else { return }
             self.enrollmentRequested = false
             self.threatLatch = ThreatLatch()
+            self.visitorWatch = VisitorWatch()
+            self.lastOwnerBox = nil
             self.ownerAppearancePrint = nil
             self.ownerTorsoPrint = nil
             self.ownerHumanPrint = nil
@@ -515,7 +736,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastAnalysis >= 0.25,
+        guard now - lastAnalysis >= 0.2,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastAnalysis = now
         let faceRequest = VNDetectFaceLandmarksRequest()
@@ -563,6 +784,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         var ownerIndex: Int?
         if let ownerPrint, !faces.isEmpty {
             var bestDistance = Float.greatestFiniteMagnitude
+            var ownerDirect = false
             let tolerance = ownerTolerance()
             for (index, face) in faces.enumerated() {
                 guard let print = featurePrint(for: face, in: pixelBuffer) else { continue }
@@ -577,20 +799,33 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                         appearanceDistance = value
                     }
                 }
-                if matchesOwner(faceDistance: distance, appearanceDistance: appearanceDistance, tolerance: tolerance),
-                   distance < bestDistance {
+                let direct = matchesOwner(faceDistance: distance, appearanceDistance: appearanceDistance, tolerance: tolerance)
+                let continued = continuesOwner(box: face.boundingBox, last: lastOwnerBox, age: now - lastOwnerSeen,
+                                               distance: distance, tolerance: tolerance)
+                if direct || continued, distance < bestDistance {
                     bestDistance = distance
                     ownerIndex = index
+                    ownerDirect = direct
                 }
+            }
+            if let ownerIndex, ownerDirect {
+                lastOwnerBox = faces[ownerIndex].boundingBox
+                lastOwnerSeen = now
             }
             if let ownerIndex, bestDistance <= tolerance, now - lastAppearanceUpdate >= 4 {
                 ownerAppearancePrint = appearancePrint(for: faces[ownerIndex], in: pixelBuffer)
                 lastAppearanceUpdate = now
             }
             // ponytail: Generic image prints can confuse similar faces; use a dedicated face model for stronger identity assurance.
-            let observations = faces.map { (box: $0.boundingBox, facing: isFacing($0)) }
+            let observations = faces.enumerated().map {
+                (box: $0.element.boundingBox, facing: isFacing($0.element, limit: $0.offset == ownerIndex ? 0.65 : 0.95))
+            }
             facingBoost = visitorBoost(observations, ownerIndex: ownerIndex)
             presenceBoost = visitorBoost(observations, ownerIndex: ownerIndex, requireFacing: false)
+            let visitors = faces.enumerated().filter { $0.offset != ownerIndex }
+                .map { (box: $0.element.boundingBox, yaw: $0.element.yaw?.doubleValue) }
+            approachAlarm = visitorWatch.alarm(visitors, now: now)
+            if approachAlarm { facingBoost = 1; presenceBoost = 1 }
         }
         if analyzeBodies, ownerPrint != nil {
             let minSpan = bodyProximityThreshold()
@@ -662,7 +897,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let bodyCount = lastBodyCount
         DispatchQueue.main.async {
             self.onBoost?(boost)
-            self.updateStatus(boost > 0.1 ? "다른 사람 감지 · 가리개 강화" :
+            self.updateStatus(boost > 0.1 ? (self.approachAlarm ? "다른 사람이 다가오거나 돌아봄 · 가리개 강화" : "다른 사람 감지 · 가리개 강화") :
                               self.hasOwner ? "카메라 감지 중 · 얼굴 \(faceCount)명 · 몸 \(bodyCount)명" : "본인 등록이 필요합니다")
         }
     }
@@ -690,9 +925,9 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         return request.results?.first
     }
 
-    private func isFacing(_ face: VNFaceObservation) -> Bool {
+    private func isFacing(_ face: VNFaceObservation, limit: Double = 0.65) -> Bool {
         facesScreen(yaw: face.yaw?.doubleValue, pitch: face.pitch?.doubleValue,
-                    bothEyesVisible: face.landmarks?.leftEye != nil && face.landmarks?.rightEye != nil)
+                    bothEyesVisible: face.landmarks?.leftEye != nil && face.landmarks?.rightEye != nil, limit: limit)
     }
 
     private func updateStatus(_ value: String) {
@@ -711,39 +946,55 @@ private final class MaskBar: NSObject {
     let panel: NSPanel
     let slider = NSSlider()
     let spotlightButton = NSButton()
-    let closeButton = NSButton()
     let settingsButton = NSButton()
+    let deleteButton = NSButton()
+    let closeButton = NSButton()
     weak var owner: ShadeApp?
     weak var mask: Mask?
+    private let barWidth: CGFloat = 330
+    private let barHeight: CGFloat = 50
 
     init(owner: ShadeApp) {
         self.owner = owner
-        panel = ControlPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 44),
+        panel = ControlPanel(contentRect: NSRect(x: 0, y: 0, width: 330, height: 50),
                              styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
+        panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let content = NSView(frame: panel.contentView?.bounds ?? .zero)
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: barWidth, height: barHeight))
         content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.94).cgColor
-        content.layer?.cornerRadius = 10
+        content.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.96).cgColor
+        content.layer?.cornerRadius = 12
+        content.layer?.borderWidth = 1
+        content.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.28).cgColor
+        let buttons: [(NSButton, String, String, Selector)] = [
+            (spotlightButton, "cursorarrow.rays", "마우스 주변 밝게", #selector(toggleSpotlight)),
+            (settingsButton, "gearshape", "가리개 설정", #selector(showSettings)),
+            (deleteButton, "trash", "이 가리개 삭제", #selector(deleteMask)),
+            (closeButton, "chevron.up", "조절 바 접기", #selector(closeBar))
+        ]
+        let start = barWidth - CGFloat(buttons.count) * 36 - 6
+        slider.frame = CGRect(x: 16, y: 13, width: start - 26, height: 24)
         slider.minValue = 0.05
         slider.maxValue = 1
         slider.isContinuous = true
+        slider.toolTip = "어둡기 · 오른쪽 끝은 완전히 가림"
         slider.target = self
         slider.action = #selector(changeOpacity(_:))
         content.addSubview(slider)
-        for (button, symbol, tip, action) in [
-            (spotlightButton, "viewfinder", "마우스 주변 밝게", #selector(toggleSpotlight)),
-            (closeButton, "xmark", "조절 바 닫기", #selector(closeBar)),
-            (settingsButton, "slider.horizontal.3", "가리개별 설정", #selector(showSettings))
-        ] {
-            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
+        for (index, (button, symbol, tip, action)) in buttons.enumerated() {
+            button.frame = CGRect(x: start + CGFloat(index) * 36, y: 9, width: 32, height: 32)
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
             button.toolTip = tip
             button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 8
+            button.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.09).cgColor
+            button.contentTintColor = symbol == "trash" ? NSColor(calibratedRed: 1, green: 0.45, blue: 0.42, alpha: 1) : .white
             button.target = self
             button.action = action
             content.addSubview(button)
@@ -755,20 +1006,13 @@ private final class MaskBar: NSObject {
         self.mask = mask
         if abs(slider.doubleValue - Double(mask.opacity)) > 0.001 { slider.doubleValue = Double(mask.opacity) }
         spotlightButton.contentTintColor = mask.spotlight ? .systemBlue : .white
-        let width = min(280, max(200, frame.width - 8))
         let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main
         let visible = screen?.visibleFrame ?? frame
-        let x = min(max(frame.maxX - width - 4, visible.minX + 4), visible.maxX - width - 4)
-        let y = frame.maxY + 44 <= visible.maxY - 4 ? frame.maxY : frame.maxY - 48
-        let barFrame = CGRect(x: x, y: y, width: width, height: 44)
+        let x = min(max(frame.maxX - barWidth - 4, visible.minX + 4), visible.maxX - barWidth - 4)
+        let y = frame.maxY + barHeight + 6 <= visible.maxY - 4 ? frame.maxY + 6 : frame.maxY - barHeight - 4
+        let barFrame = CGRect(x: x, y: y, width: barWidth, height: barHeight)
         if mask.controlOccluders.contains(where: { $0.intersects(barFrame) }) { hide(); return }
-        if panel.frame != barFrame {
-            panel.setFrame(barFrame, display: true)
-            slider.frame = CGRect(x: 10, y: 10, width: width - 112, height: 24)
-            for (index, button) in [spotlightButton, closeButton, settingsButton].enumerated() {
-                button.frame = CGRect(x: width - 96 + CGFloat(index * 30), y: 8, width: 28, height: 28)
-            }
-        }
+        if panel.frame != barFrame { panel.setFrame(barFrame, display: true) }
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
@@ -780,6 +1024,7 @@ private final class MaskBar: NSObject {
     }
     @objc private func toggleSpotlight() { if let mask { owner?.toggleSpotlightFor(mask) } }
     @objc private func closeBar() { owner?.closeBar() }
+    @objc private func deleteMask() { if let mask { owner?.deleteMask(mask) } }
     @objc private func showSettings() {
         guard let mask else { return }
         owner?.showSettings(for: mask, at: settingsButton)
@@ -790,26 +1035,30 @@ private final class MaskHandle: NSObject {
     let panel: NSPanel
     weak var owner: ShadeApp?
     weak var mask: Mask?
+    private let size: CGFloat = 36
 
     init(owner: ShadeApp, mask: Mask) {
         self.owner = owner
         self.mask = mask
-        panel = ControlPanel(contentRect: NSRect(x: 0, y: 0, width: 32, height: 32),
+        panel = ControlPanel(contentRect: NSRect(x: 0, y: 0, width: 36, height: 36),
                              styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
+        panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
-        button.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "가리개 조절 열기")
+        let button = ChipButton(frame: NSRect(x: 0, y: 0, width: 36, height: 36))
+        button.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "가리개 조절 열기")?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
         button.toolTip = "클릭해서 이 가리개 조절"
         button.isBordered = false
         button.contentTintColor = .white
         button.wantsLayer = true
-        button.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.94).cgColor
-        button.layer?.cornerRadius = 9
+        button.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.96).cgColor
+        button.layer?.cornerRadius = 10
+        button.layer?.borderWidth = 1.5
+        button.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.55).cgColor
         button.target = self
         button.action = #selector(openBar)
         panel.contentView = button
@@ -818,9 +1067,9 @@ private final class MaskHandle: NSObject {
     func place(near frame: CGRect) {
         let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) ?? NSScreen.main
         let visible = screen?.visibleFrame ?? frame
-        let x = min(max(frame.maxX - 32, visible.minX + 4), visible.maxX - 36)
-        let y = frame.maxY + 32 <= visible.maxY - 4 ? frame.maxY : frame.maxY - 34
-        let position = CGRect(x: x, y: y, width: 32, height: 32)
+        let x = min(max(frame.maxX - size, visible.minX + 4), visible.maxX - size - 4)
+        let y = frame.maxY + size + 4 <= visible.maxY - 4 ? frame.maxY + 4 : frame.maxY - size - 4
+        let position = CGRect(x: x, y: y, width: size, height: size)
         if mask?.controlOccluders.contains(where: { $0.intersects(position) }) == true { hide(); return }
         if panel.frame != position { panel.setFrame(position, display: true) }
         if !panel.isVisible { panel.orderFrontRegardless() }
@@ -872,6 +1121,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cameraGuard.loadOwner()
 
         let mirror = Mask(target: .mirror, name: "아이폰 미러링")
+        mirror.owner = self
         mirror.contentOnly = true
         mirror.opacity = CGFloat(UserDefaults.standard.double(forKey: "mirrorOpacity"))
         if mirror.opacity == 0 { mirror.opacity = 0.35 }
@@ -926,10 +1176,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if !mask.panel.isVisible { mask.panel.orderFrontRegardless() }
                     continue
                 }
-                let top = mask.contentOnly ? min(mask.topInset, target.frame.height - 1) : 0
-                let area = mask.customRegion.map { regionFrame($0, in: target.frame) }
-                    ?? CGRect(x: target.frame.minX, y: target.frame.minY + top,
-                              width: target.frame.width, height: target.frame.height - top)
+                let area = maskArea(mask, in: target.frame)
                 var exposed = [CGRect(origin: .zero, size: area.size)]
                 for obstacle in windows[..<index] where obstacle.pid != getpid() && obstacle.pid != target.pid {
                     let overlap = area.intersection(obstacle.frame)
@@ -957,6 +1204,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             handles.removeValue(forKey: id)
         }
         for mask in masks {
+            mask.syncEditToolbar()
             let id = ObjectIdentifier(mask)
             let handle = handles[id] ?? MaskHandle(owner: self, mask: mask)
             handles[id] = handle
@@ -992,7 +1240,8 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.addItem(item("아이폰 미러링 가리개", #selector(selectMirror)))
-        menu.addItem(item("현재 창에 가리개 붙이기", #selector(addCurrentWindow)))
+        menu.addItem(item("현재 창 전체 가리기", #selector(addCurrentWindow)))
+        menu.addItem(item("현재 창 일부만 가리기…", #selector(addCurrentWindowRegion)))
         let pick = NSMenuItem(title: "창 선택해서 붙이기", action: nil, keyEquivalent: "")
         let choices = NSMenu()
         for window in visibleWindows() where window.pid != getpid() &&
@@ -1048,6 +1297,8 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             border.tag = index
             border.state = mask.border ? .on : .off
             submenu.addItem(border)
+            submenu.addItem(disabledLabel("모서리 둥글기 · 0은 각진 모서리"))
+            submenu.addItem(sliderItem(Double(mask.cornerRadius), 0, 28, index, #selector(changeCornerRadius(_:))))
             let color = NSMenuItem(title: "가리개 색", action: nil, keyEquivalent: "")
             let colorChoices = NSMenu()
             for (title, shade) in [
@@ -1093,7 +1344,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     areaMenu.addItem(sliderItem(Double(mask.topInset), 20, 120, index, #selector(changeTopInset(_:))))
                 }
                 areaMenu.addItem(.separator())
-                let editRegion = item(mask.editing ? "영역 조절 마치기" : "자유 영역 조절…", #selector(toggleEditing(_:)))
+                let editRegion = item(mask.editing ? "✓ 이 영역으로 고정" : "영역 직접 조절…", #selector(toggleEditing(_:)))
                 editRegion.tag = index
                 editRegion.state = mask.customRegion != nil ? .on : .off
                 areaMenu.addItem(editRegion)
@@ -1105,11 +1356,12 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if case .floating = mask.target {
                 submenu.addItem(.separator())
-                let edit = item(mask.editing ? "위치 조절 마치기" : "위치·크기 조절", #selector(toggleEditing))
+                let edit = item(mask.editing ? "✓ 이 위치로 고정" : "위치·크기 조절", #selector(toggleEditing))
                 edit.tag = index
                 submenu.addItem(edit)
             }
-            if index != 0 {
+            if case .mirror = mask.target {
+            } else {
                 submenu.addItem(.separator())
                 let remove = item("삭제", #selector(removeMask))
                 remove.tag = index
@@ -1148,7 +1400,23 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    @objc private func selectMirror() { selected = masks[0]; masks[0].enabled = true; hidden = false; refresh() }
+    @objc private func selectMirror() {
+        let mirror: Mask
+        if let existing = masks.first(where: { if case .mirror = $0.target { true } else { false } }) {
+            mirror = existing
+        } else {
+            mirror = Mask(target: .mirror, name: "아이폰 미러링")
+            mirror.owner = self
+            mirror.contentOnly = true
+            mirror.opacity = CGFloat(UserDefaults.standard.double(forKey: "mirrorOpacity"))
+            if mirror.opacity == 0 { mirror.opacity = 0.35 }
+            masks.insert(mirror, at: 0)
+        }
+        selected = mirror
+        mirror.enabled = true
+        hidden = false
+        refresh()
+    }
     @objc private func selectMask(_ sender: NSMenuItem) { selected = masks[sender.tag] }
     @objc private func toggleMask(_ sender: NSMenuItem) {
         let mask = masks[sender.tag]
@@ -1157,20 +1425,56 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
-    @objc private func addCurrentWindow() {
-        let window = visibleWindows().first {
+    private func maskArea(_ mask: Mask, in target: CGRect) -> CGRect {
+        let top = mask.contentOnly ? min(mask.topInset, target.height - 1) : 0
+        return mask.customRegion.map { regionFrame($0, in: target) }
+            ?? CGRect(x: target.minX, y: target.minY + top, width: target.width, height: target.height - top)
+    }
+
+    private func beginEditing(_ mask: Mask) {
+        mask.enabled = true
+        hidden = false
+        refresh()
+        if let anchor = mask.anchorFrame {
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+            let area = maskArea(mask, in: quartzFrame(anchor, primaryHeight: primaryHeight))
+            mask.panel.setFrame(cocoaFrame(area, primaryHeight: primaryHeight), display: true)
+        }
+        mask.setEditing(true)
+        if bar.mask === mask { bar.hide() }
+        refreshControls()
+        NSApp.activate(ignoringOtherApps: true)
+        mask.panel.makeKey()
+    }
+
+    @discardableResult
+    private func attachCurrentWindow() -> Mask? {
+        let candidates = visibleWindows().filter {
             $0.pid != getpid() && NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier != mirrorBundleID
         }
-        guard let window else { NSSound.beep(); return }
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let window = candidates.first { $0.pid == frontPID } ?? candidates.first
+        guard let window else { NSSound.beep(); return nil }
         let mask = Mask(target: .window(window.id), name: window.displayName)
+        mask.owner = self
         masks.append(mask)
         selected = mask
         refresh()
+        return mask
+    }
+
+    @objc private func addCurrentWindow() { attachCurrentWindow() }
+
+    @objc private func addCurrentWindowRegion() {
+        guard let mask = attachCurrentWindow() else { return }
+        mask.customRegion = CGRect(x: 0.15, y: 0.2, width: 0.7, height: 0.5)
+        beginEditing(mask)
     }
 
     @objc private func addChosenWindow(_ sender: NSMenuItem) {
         guard let window = visibleWindows().first(where: { $0.id == sender.tag }) else { NSSound.beep(); return }
         let mask = Mask(target: .window(window.id), name: window.displayName)
+        mask.owner = self
         masks.append(mask)
         selected = mask
         refresh()
@@ -1178,10 +1482,10 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func addFloating() {
         let mask = Mask(target: .floating, name: "떠 있는 가리개 \(masks.count)")
+        mask.owner = self
         masks.append(mask)
         selected = mask
-        mask.setEditing(true)
-        refresh()
+        beginEditing(mask)
     }
 
     @objc private func addRegionSameWindow(_ sender: NSMenuItem) {
@@ -1190,53 +1494,61 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let baseName = source.name.components(separatedBy: " · 영역").first ?? source.name
         let count = masks.filter { $0.name.hasPrefix(baseName + " · 영역") }.count + 1
         let mask = Mask(target: source.target, name: "\(baseName) · 영역 \(count)")
+        mask.owner = self
         mask.customRegion = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.35)
         mask.opacity = source.opacity
         mask.color = source.color
         masks.append(mask)
         selected = mask
-        refresh()
-        if mask.panel.isVisible { mask.setEditing(true); refreshControls() }
+        beginEditing(mask)
     }
 
     @objc private func toggleEditing(_ sender: NSMenuItem) {
         let mask = masks[sender.tag]
         if mask.editing {
-            mask.setEditing(false)
-            switch mask.target {
-            case .floating: break
-            case .mirror, .window:
-                if let anchor = mask.anchorFrame {
-                    let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-                    let target = quartzFrame(anchor, primaryHeight: primaryHeight)
-                    let area = quartzFrame(mask.panel.frame, primaryHeight: primaryHeight)
-                    if let region = normalizedRegion(for: area, in: target) { mask.customRegion = region }
-                }
-            }
-            refresh()
+            finishEditing(mask)
         } else {
-            mask.enabled = true
-            hidden = false
-            refresh()
-            mask.setEditing(true)
-            if bar.mask === mask { bar.hide() }
-            refreshControls()
+            beginEditing(mask)
         }
     }
 
     @objc private func removeMask(_ sender: NSMenuItem) {
-        let mask = masks.remove(at: sender.tag)
+        guard masks.indices.contains(sender.tag) else { return }
+        deleteMask(masks[sender.tag])
+    }
+
+    func deleteMask(_ mask: Mask) {
+        guard let index = masks.firstIndex(where: { $0 === mask }) else { return }
+        masks.remove(at: index)
+        mask.setEditing(false)
         mask.panel.orderOut(nil)
         if bar.mask === mask { bar.hide() }
         if colorTarget === mask { colorTarget = nil; NSColorPanel.shared.orderOut(nil) }
         if selected === mask { selected = masks.first }
+        refresh()
+    }
+
+    func finishEditing(_ mask: Mask) {
+        guard mask.editing else { return }
+        mask.setEditing(false)
+        switch mask.target {
+        case .floating: break
+        case .mirror, .window:
+            if let anchor = mask.anchorFrame {
+                let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+                let target = quartzFrame(anchor, primaryHeight: primaryHeight)
+                let area = quartzFrame(mask.panel.frame, primaryHeight: primaryHeight)
+                if let region = normalizedRegion(for: area, in: target) { mask.customRegion = region }
+            }
+        }
+        refresh()
     }
 
     @objc private func changeOpacity(_ slider: NSSlider) { setOpacity(masks[slider.tag], value: slider.doubleValue) }
 
     func setOpacity(_ mask: Mask, value: Double) {
         mask.opacity = CGFloat(value)
-        if mask === masks.first { UserDefaults.standard.set(value, forKey: "mirrorOpacity") }
+        if case .mirror = mask.target { UserDefaults.standard.set(value, forKey: "mirrorOpacity") }
     }
 
     func hideMask(_ mask: Mask) {
@@ -1253,6 +1565,9 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .submenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.maxY), in: view)
     }
 
+    @objc private func changeCornerRadius(_ slider: NSSlider) {
+        masks[slider.tag].cornerRadius = CGFloat(slider.doubleValue.rounded())
+    }
     @objc private func changeSpotlightRadius(_ slider: NSSlider) {
         masks[slider.tag].spotlightRadius = CGFloat(slider.doubleValue)
     }
@@ -1353,6 +1668,13 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(regionFrame(region, in: CGRect(x: 500, y: 500, width: 800, height: 300))
                  == CGRect(x: 700, y: 530, width: 320, height: 60))
     precondition(normalizedRegion(for: CGRect(x: 2000, y: 2000, width: 20, height: 20), in: targetFrame) == nil)
+    let editBase = CGRect(x: 100, y: 100, width: 300, height: 200)
+    precondition(editedFrame(editBase, dx: 20, dy: -10, edges: []) == CGRect(x: 120, y: 90, width: 300, height: 200))
+    precondition(editedFrame(editBase, dx: 50, dy: 0, edges: .right) == CGRect(x: 100, y: 100, width: 350, height: 200))
+    precondition(editedFrame(editBase, dx: 50, dy: 0, edges: .left) == CGRect(x: 150, y: 100, width: 250, height: 200))
+    precondition(editedFrame(editBase, dx: 500, dy: 0, edges: .left) == CGRect(x: 280, y: 100, width: 120, height: 200))
+    precondition(editedFrame(editBase, dx: 0, dy: 30, edges: .top) == CGRect(x: 100, y: 100, width: 300, height: 230))
+    precondition(editedFrame(editBase, dx: 0, dy: 500, edges: .bottom) == CGRect(x: 100, y: 240, width: 300, height: 60))
     let ownerFace = (box: CGRect(x: 0.3, y: 0.3, width: 0.2, height: 0.2), facing: true)
     let visitorFace = (box: CGRect(x: 0.7, y: 0.3, width: 0.24, height: 0.24), facing: true)
     precondition(visitorBoost([ownerFace], ownerIndex: 0) == 0)
@@ -1376,6 +1698,25 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(facesScreen(yaw: 0.1, pitch: 0.2, bothEyesVisible: true))
     precondition(!facesScreen(yaw: 0.9, pitch: 0, bothEyesVisible: true))
     precondition(!facesScreen(yaw: nil, pitch: nil, bothEyesVisible: false))
+    precondition(!facesScreen(yaw: 0.8, pitch: 0, bothEyesVisible: true))
+    precondition(facesScreen(yaw: 0.8, pitch: 0, bothEyesVisible: true, limit: 0.95))
+    let ob = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+    precondition(continuesOwner(box: ob.offsetBy(dx: 0.05, dy: 0), last: ob, age: 1, distance: 1.05, tolerance: 0.9))
+    precondition(!continuesOwner(box: ob.offsetBy(dx: 0.05, dy: 0), last: ob, age: 2, distance: 1.05, tolerance: 0.9))
+    precondition(!continuesOwner(box: ob.offsetBy(dx: 0.3, dy: 0), last: ob, age: 1, distance: 1.05, tolerance: 0.9))
+    precondition(!continuesOwner(box: ob, last: ob, age: 1, distance: 1.3, tolerance: 0.9))
+    precondition(!continuesOwner(box: ob, last: nil, age: 0, distance: 0.5, tolerance: 0.9))
+    var watch = VisitorWatch()
+    let vbox = CGRect(x: 0.7, y: 0.3, width: 0.1, height: 0.1)
+    precondition(!watch.alarm([(vbox, 1.1)], now: 1))
+    precondition(!watch.alarm([(vbox, 1.05)], now: 1.4))
+    precondition(watch.alarm([(vbox, 0.7)], now: 1.8))
+    var watch2 = VisitorWatch()
+    precondition(!watch2.alarm([(vbox, 1.5)], now: 5))
+    precondition(watch2.alarm([(CGRect(x: 0.68, y: 0.28, width: 0.13, height: 0.13), 1.5)], now: 5.5))
+    var watch3 = VisitorWatch()
+    precondition(!watch3.alarm([(vbox, 0.1)], now: 9))
+    precondition(!watch3.alarm([(vbox, 0.1)], now: 9.6))
     let frontTorso = Torso(left: CGPoint(x: 0.68, y: 0.55), right: CGPoint(x: 0.32, y: 0.54))
     precondition(frontTorso.isCloseAndFront(order: 1, minSpan: 0.22))
     precondition(frontTorso.containsFace(CGRect(x: 0.45, y: 0.6, width: 0.1, height: 0.15)))
@@ -1459,7 +1800,8 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(mirrorControls?.items.compactMap { $0.view?.subviews.first as? NSSlider }.contains(where: { $0.maxValue == 1 }) == true)
     precondition(mirrorControls?.items.first(where: { $0.title == "가리는 영역" })?.submenu?.items.contains(where: { $0.title == "아이폰 화면만 가리기" }) == true)
     precondition(mirrorControls?.items.contains(where: { $0.title == "같은 창에 새 영역 추가" }) == true)
-    precondition(mirrorControls?.items.first(where: { $0.title == "가리는 영역" })?.submenu?.items.contains(where: { $0.title == "자유 영역 조절…" }) == true)
+    precondition(mirrorControls?.items.contains(where: { $0.title.contains("모서리 둥글기") }) == true)
+    precondition(mirrorControls?.items.first(where: { $0.title == "가리는 영역" })?.submenu?.items.contains(where: { $0.title == "영역 직접 조절…" }) == true)
     let colors = mirrorControls!.items.first(where: { $0.title == "가리개 색" })!.submenu!
     let navy = colors.items.first(where: { $0.title == "남색" })!
     precondition(NSApp.sendAction(navy.action!, to: navy.target, from: navy))
@@ -1485,3 +1827,4 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
