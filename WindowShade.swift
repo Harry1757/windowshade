@@ -232,6 +232,17 @@ private struct HandHold {
     }
 }
 
+// 내 손 판정: 이번 프레임에 내 얼굴이 보이고, 손이 내 얼굴 가까이에 있으며,
+// 손 크기가 내 얼굴에 비해 충분히 커야(=나와 같은 거리 이내) 하고, 다른 사람 얼굴보다 내 얼굴에 더 가까워야 한다.
+// size는 손목~가운뎃손가락 뿌리 길이(화면 너비 기준). 뒤에 있는 사람의 손은 작게 찍혀 걸러진다.
+private func isOwnerHand(wrist: CGPoint, size: CGFloat, owner: CGRect?, others: [CGRect]) -> Bool {
+    guard let owner, owner.width > 0.01, size >= owner.width * 0.4 else { return false }
+    let dx = abs(wrist.x - owner.midX) / owner.width
+    guard dx <= 2.5, wrist.y <= owner.maxY + owner.height * 1.5 else { return false }
+    let mine = hypot(wrist.x - owner.midX, wrist.y - owner.midY) / owner.width
+    return !others.contains { hypot(wrist.x - $0.midX, wrist.y - $0.midY) / max($0.width, 0.01) < mine }
+}
+
 private func isOpenHand(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
     fingers.filter { $0.base > 0.02 && $0.tip >= $0.base * 1.6 }.count >= 3
 }
@@ -652,7 +663,7 @@ private enum OwnerFaceStore {
 private struct CameraDebug {
     struct Face { var box: CGRect; var distance: Float?; var owner: Bool; var facing: Bool; var meters: CGFloat }
     struct Body { var left: CGPoint; var right: CGPoint; var meters: CGFloat; var owner: Bool; var hasFace: Bool }
-    struct Hand { var point: CGPoint; var fist: Bool? }
+    struct Hand { var point: CGPoint; var fist: Bool?; var mine: Bool }
     var faces: [Face]
     var bodies: [Body]
     var hands: [Hand]
@@ -1035,6 +1046,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         var hands: [CameraDebug.Hand] = []
         var gestureSet: Bool?
         if gestureOn {
+            // 가로:세로 비율. 세로 좌표를 가로 기준 길이로 맞춘다.
+            let aspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(1, CVPixelBufferGetHeight(pixelBuffer)))
             let tips: [VNHumanHandPoseObservation.JointName] = [.indexTip, .middleTip, .ringTip, .littleTip]
             let bases: [VNHumanHandPoseObservation.JointName] = [.indexMCP, .middleMCP, .ringMCP, .littleMCP]
             for hand in handRequest.results ?? [] {
@@ -1046,13 +1059,15 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 let fingers = zip(tips, bases).compactMap { tip, base in
                     gap(tip).flatMap { t in gap(base).map { (tip: t, base: $0) } }
                 }
-                // 내 자리 근처의 손만 쓴다.
-                guard ownerTrack.near(wrist.location.x, now: now, spread: 3) else { continue }
+                guard let knuckle = try? hand.recognizedPoint(.middleMCP), knuckle.confidence >= 0.3 else { continue }
+                let size = hypot(knuckle.location.x - wrist.location.x, (knuckle.location.y - wrist.location.y) / aspect)
+                let mine = isOwnerHand(wrist: wrist.location, size: size, owner: ownerIndex.map { faces[$0].boundingBox },
+                                       others: faces.indices.filter { $0 != ownerIndex }.map { faces[$0].boundingBox })
                 let state: Bool? = fingers.count < 3 ? nil : isFist(fingers) ? true : isOpenHand(fingers) ? false : nil
-                hands.append(.init(point: wrist.location, fist: state))
+                hands.append(.init(point: wrist.location, fist: state, mine: mine))
             }
-            if fistHold.update(fist: hands.contains { $0.fist == true }, now: now) { gestureSet = true }
-            if palmHold.update(fist: hands.contains { $0.fist == false }, now: now) { gestureSet = false }
+            if fistHold.update(fist: hands.contains { $0.mine && $0.fist == true }, now: now) { gestureSet = true }
+            if palmHold.update(fist: hands.contains { $0.mine && $0.fist == false }, now: now) { gestureSet = false }
         }
         if let gestureSet {
             DispatchQueue.main.async {
@@ -1240,11 +1255,13 @@ private final class CameraOverlay: NSView {
         }
         for hand in debug.hands {
             let center = point(hand.point)
-            NSColor.systemBlue.setFill()
+            let color: NSColor = hand.mine ? .systemBlue : .systemGray
+            color.setFill()
             NSBezierPath(ovalIn: NSRect(x: center.x - 11, y: center.y - 11, width: 22, height: 22)).fill()
-            let state = hand.fist == true ? "✊ 주먹" : hand.fist == false ? "✋ 손바닥" : "내 손"
-            let progress = hand.fist != nil && debug.gestureProgress < 1 ? String(format: " · %.1f초", debug.gestureProgress * 0.5) : ""
-            label(state + progress, at: NSPoint(x: center.x - 30, y: center.y + 16), color: .systemBlue)
+            let state = hand.fist == true ? "✊ 주먹" : hand.fist == false ? "✋ 손바닥" : "손"
+            let text = !hand.mine ? "다른 손 · 무시" :
+                state + (hand.fist != nil && debug.gestureProgress < 1 ? String(format: " · %.1f초", debug.gestureProgress * 0.5) : "")
+            label(text, at: NSPoint(x: center.x - 30, y: center.y + 16), color: color)
         }
         // 얼굴 없이 몸만 보이는 다른 사람만 표시한다. 내 몸과 얼굴이 보이는 사람은 네모로 충분하다.
         for body in debug.bodies where !body.owner && !body.hasFace {
@@ -2235,7 +2252,14 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!hold.update(fist: false, now: 2.5))
     precondition(!hold.update(fist: true, now: 2.6) && hold.update(fist: true, now: 3.2))
     var brief = HandHold()
-    precondition(!brief.update(fist: true, now: 0) && !brief.update(fist: false, now: 0.3) && !brief.update(fist: true, now: 0.9))
+    precondition(!brief.update(fist: true, now: 0) && !brief.update(fist: false, now: 0.45) && !brief.update(fist: true, now: 0.9))
+    let me = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.25)
+    let back = CGRect(x: 0.75, y: 0.6, width: 0.06, height: 0.08)
+    precondition(isOwnerHand(wrist: CGPoint(x: 0.3, y: 0.45), size: 0.12, owner: me, others: [back]))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.3, y: 0.45), size: 0.12, owner: nil, others: []))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.5, y: 0.5), size: 0.04, owner: me, others: []))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.78, y: 0.58), size: 0.09, owner: me, others: [back]))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.99, y: 0.45), size: 0.12, owner: CGRect(x: 0.2, y: 0.4, width: 0.1, height: 0.12), others: []))
     precondition(sameFace(CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2), CGRect(x: 0.12, y: 0.12, width: 0.2, height: 0.2)))
     precondition(!sameFace(CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1), CGRect(x: 0.5, y: 0.5, width: 0.1, height: 0.1)))
     var watch = VisitorWatch()
@@ -2359,6 +2383,8 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
+
 
 
 
