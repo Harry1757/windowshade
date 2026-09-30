@@ -232,18 +232,24 @@ private struct HandHold {
     }
 }
 
-// 내 손 판정: 손목이 내 몸 뼈대(내 얼굴에 붙은 자세)의 손목과 겹쳐야 한다.
-// 내 팔에 이어진 손만 인정하므로 옆·뒤 사람 손은 얼굴이 안 보여도 걸러진다.
-// 좌표는 가로 기준 길이로 맞춘 값(y에 aspect를 나눈 값)을 쓴다.
+// 내 손 판정 순서:
+// 1) 내 몸 뼈대의 손목과 겹치면 내 손.
+// 2) 다른 사람 몸 뼈대의 손목과 겹치면 남의 손.
+// 3) 팔이 안 보여 손목이 안 잡힌 경우: 내 얼굴 가까이에 있고 내 얼굴 크기에 맞게 크게 찍힌 손만 내 손.
+// 다른 사람 얼굴이 내 얼굴보다 이 손에 더 가까우면 항상 남의 손. 좌표는 가로 기준 길이로 맞춘 값을 쓴다.
 private func isOwnerHand(wrist: CGPoint, size: CGFloat, owner: CGRect?,
                          ownerWrists: [CGPoint], otherWrists: [CGPoint], otherFaces: [CGRect]) -> Bool {
     guard let owner, owner.width > 0.01, size >= owner.width * 0.4 else { return false }
-    func gap(_ p: CGPoint) -> CGFloat { hypot(p.x - wrist.x, p.y - wrist.y) }
-    guard let mine = ownerWrists.map(gap).min(), mine <= owner.width * 0.9 else { return false }
-    if otherWrists.contains(where: { gap($0) < mine }) { return false }
-    // 다른 사람 얼굴이 내 얼굴보다 이 손에 더 가까우면 그 사람 손으로 본다.
     let toMe = hypot(wrist.x - owner.midX, wrist.y - owner.midY) / owner.width
-    return !otherFaces.contains { hypot(wrist.x - $0.midX, wrist.y - $0.midY) / max($0.width, 0.01) < toMe }
+    if otherFaces.contains(where: { hypot(wrist.x - $0.midX, wrist.y - $0.midY) / max($0.width, 0.01) < toMe }) { return false }
+    func gap(_ p: CGPoint) -> CGFloat { hypot(p.x - wrist.x, p.y - wrist.y) }
+    let reach = owner.width * 0.9
+    let mine = ownerWrists.map(gap).min() ?? .greatestFiniteMagnitude
+    let theirs = otherWrists.map(gap).min() ?? .greatestFiniteMagnitude
+    if mine <= reach && mine <= theirs { return true }
+    if theirs <= reach { return false }
+    // ponytail: 팔이 안 보이면 얼굴 거리·손 크기로만 본다. 옆에 붙어 앉은 사람 손은 여기서 통과할 수 있다.
+    return abs(wrist.x - owner.midX) <= owner.width * 2.5 && wrist.y <= owner.maxY + owner.height * 1.5
 }
 
 private func isOpenHand(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
@@ -2280,13 +2286,18 @@ if CommandLine.arguments.contains("--self-test") {
     let me = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.25)
     let back = CGRect(x: 0.75, y: 0.6, width: 0.06, height: 0.08)
     let hw = CGPoint(x: 0.3, y: 0.45)
+    // 내 손목과 겹침 → 내 손
     precondition(isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.32, y: 0.43)], otherWrists: [], otherFaces: [back]))
-    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: nil, ownerWrists: [hw], otherWrists: [], otherFaces: []))
-    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [], otherWrists: [], otherFaces: []))
-    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.7, y: 0.3)], otherWrists: [], otherFaces: []))
+    // 팔이 안 보여 손목이 없어도 얼굴 근처의 큰 손 → 내 손
+    precondition(isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [], otherWrists: [], otherFaces: []))
+    // 다른 사람 손목과 겹침 → 남의 손
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [], otherWrists: [CGPoint(x: 0.31, y: 0.45)], otherFaces: []))
     precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.4, y: 0.45)], otherWrists: [CGPoint(x: 0.31, y: 0.45)], otherFaces: []))
+    // 내 얼굴이 없거나, 손이 작게(멀리) 찍히거나, 다른 얼굴에 더 가까우면 → 남의 손
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: nil, ownerWrists: [hw], otherWrists: [], otherFaces: []))
     precondition(!isOwnerHand(wrist: hw, size: 0.04, owner: me, ownerWrists: [hw], otherWrists: [], otherFaces: []))
-    precondition(!isOwnerHand(wrist: CGPoint(x: 0.78, y: 0.58), size: 0.09, owner: me, ownerWrists: [CGPoint(x: 0.7, y: 0.55)], otherWrists: [], otherFaces: [back]))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.78, y: 0.58), size: 0.09, owner: me, ownerWrists: [], otherWrists: [], otherFaces: [back]))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.99, y: 0.45), size: 0.12, owner: CGRect(x: 0.2, y: 0.4, width: 0.1, height: 0.12), ownerWrists: [], otherWrists: [], otherFaces: []))
     precondition(sameFace(CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2), CGRect(x: 0.12, y: 0.12, width: 0.2, height: 0.2)))
     precondition(!sameFace(CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1), CGRect(x: 0.5, y: 0.5, width: 0.1, height: 0.1)))
     var watch = VisitorWatch()
@@ -2410,6 +2421,7 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
 
 
 
