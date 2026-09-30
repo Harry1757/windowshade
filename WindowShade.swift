@@ -81,7 +81,7 @@ private func visitorBoost(_ faces: [(box: CGRect, facing: Bool)], ownerIndex: In
 }
 
 private func ownerTolerance() -> Float {
-    Float(min(1.25, max(0.55, UserDefaults.standard.object(forKey: "ownerTolerance") as? Double ?? 0.9)))
+    Float(min(1.25, max(0.25, UserDefaults.standard.object(forKey: "ownerTolerance") as? Double ?? 0.9)))
 }
 
 private func matchesOwner(faceDistance: Float?, appearanceDistance: Float?, tolerance: Float) -> Bool {
@@ -554,8 +554,37 @@ private enum OwnerFaceStore {
     }
 }
 
+// 미리보기 창에 보여줄 프레임별 분석 결과.
+private struct CameraDebug {
+    struct Face { var box: CGRect; var distance: Float?; var owner: Bool; var facing: Bool }
+    struct Body { var left: CGPoint; var right: CGPoint; var span: CGFloat; var owner: Bool }
+    var faces: [Face]
+    var bodies: [Body]
+    var boost: CGFloat
+    var alarm: Bool
+}
+
+extension CameraDebug {
+    // 지금 슬라이더 값으로 가려질지 즉시 계산한다(미리보기 전용).
+    func verdict(face: Double, body: Double) -> (hidden: Bool, reason: String) {
+        for item in faces {
+            guard let distance = item.distance, Double(distance) > face else { continue }
+            if item.owner { return (true, "내 얼굴이 '남'으로 판단됨 → 선을 오른쪽으로") }
+            if item.facing { return (true, "다른 사람이 화면을 보고 있어 가려집니다") }
+        }
+        if bodies.contains(where: { !$0.owner && Double($0.span) >= body }) {
+            return (true, "다른 사람이 가까이 있어 가려집니다")
+        }
+        if alarm { return (true, "다른 사람이 다가오거나 돌아봐서 가려집니다") }
+        return (false, "")
+    }
+}
+
 private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
+    var captureSession: AVCaptureSession { session }
+    var onDebug: ((CameraDebug) -> Void)?
+    private var lastBodies: [CameraDebug.Body] = []
     private let analysisQueue = DispatchQueue(label: "local.windowshade.camera", qos: .userInitiated)
     private var configured = false
     private var starting = false
@@ -749,6 +778,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         if analyzeBodies {
             lastBodyAnalysis = now
             lastBodyCount = humanRequest.results?.count ?? 0
+            lastBodies = []
         }
         let faces = faceRequest.results ?? []
 
@@ -782,6 +812,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         var facingBoost: CGFloat = 0
         var presenceBoost: CGFloat = 0
         var ownerIndex: Int?
+        var distances = [Float?](repeating: nil, count: faces.count)
         if let ownerPrint, !faces.isEmpty {
             var bestDistance = Float.greatestFiniteMagnitude
             var ownerDirect = false
@@ -790,6 +821,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 guard let print = featurePrint(for: face, in: pixelBuffer) else { continue }
                 var distance: Float = 0
                 guard (try? print.computeDistance(&distance, to: ownerPrint)) != nil else { continue }
+                distances[index] = distance
                 var appearanceDistance: Float?
                 if distance > tolerance, distance <= tolerance + 0.15,
                    let ownerAppearancePrint,
@@ -841,6 +873,8 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 let pairedFace = faces.indices.filter { torso.containsFace(faces[$0].boundingBox) }
                     .min { abs(faces[$0].boundingBox.midX - torso.centerX) <
                            abs(faces[$1].boundingBox.midX - torso.centerX) }
+                lastBodies.append(.init(left: torso.left, right: torso.right, span: torso.span,
+                                        owner: pairedFace != nil && pairedFace == ownerIndex))
                 if let ownerIndex, pairedFace == ownerIndex {
                     if isFacing(faces[ownerIndex]), torso.isCloseAndFront(order: 0, minSpan: 0.16) {
                         ownerShoulderOrder = torso.order
@@ -895,6 +929,15 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let boost = target
         let faceCount = faces.count
         let bodyCount = lastBodyCount
+        if let onDebug {
+            let debug = CameraDebug(
+                faces: faces.enumerated().map {
+                    .init(box: $0.element.boundingBox, distance: distances[$0.offset], owner: $0.offset == ownerIndex,
+                          facing: isFacing($0.element, limit: $0.offset == ownerIndex ? 0.65 : 0.95))
+                },
+                bodies: lastBodies, boost: boost, alarm: approachAlarm)
+            DispatchQueue.main.async { onDebug(debug) }
+        }
         DispatchQueue.main.async {
             self.onBoost?(boost)
             self.updateStatus(boost > 0.1 ? (self.approachAlarm ? "다른 사람이 다가오거나 돌아봄 · 가리개 강화" : "다른 사람 감지 · 가리개 강화") :
@@ -934,6 +977,311 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         guard status != value else { return }
         status = value
         onStatus?(value)
+    }
+}
+
+// 기준선을 끌어 조절하는 눈금. 측정값이 마커로 함께 표시된다.
+private final class ThresholdMeter: NSView {
+    let lo: Double, hi: Double, limitLo: Double, limitHi: Double
+    let leftText: String, rightText: String
+    let minText: String, maxText: String
+    let leftColor: NSColor, rightColor: NSColor
+    var threshold: Double { didSet { needsDisplay = true } }
+    var markers: [(value: Double, color: NSColor, label: String)] = [] { didSet { needsDisplay = true } }
+    var onChange: ((Double) -> Void)?
+    private let inset: CGFloat = 14
+
+    init(frame: NSRect, range: ClosedRange<Double>, limits: ClosedRange<Double>, threshold: Double,
+         left: (String, NSColor), right: (String, NSColor), ends: (String, String)) {
+        lo = range.lowerBound; hi = range.upperBound
+        limitLo = limits.lowerBound; limitHi = limits.upperBound
+        self.threshold = threshold
+        leftText = left.0; leftColor = left.1; rightText = right.0; rightColor = right.1
+        minText = ends.0; maxText = ends.1
+        super.init(frame: frame)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func x(_ value: Double) -> CGFloat {
+        inset + CGFloat((min(hi, max(lo, value)) - lo) / (hi - lo)) * (bounds.width - 2 * inset)
+    }
+    func value(atX x: CGFloat) -> Double {
+        let fraction = Double((x - inset) / (bounds.width - 2 * inset))
+        return min(limitHi, max(limitLo, lo + fraction * (hi - lo)))
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { drag(event) }
+    override func mouseDragged(with event: NSEvent) { drag(event) }
+    private func drag(_ event: NSEvent) {
+        threshold = value(atX: convert(event.locationInWindow, from: nil).x)
+        onChange?(threshold)
+    }
+
+    private func text(_ string: String, at point: NSPoint, color: NSColor, size: CGFloat = 10.5, centered: Bool = false) {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size, weight: .medium),
+                                                         .foregroundColor: color]
+        let width = (string as NSString).size(withAttributes: attributes).width
+        (string as NSString).draw(at: NSPoint(x: centered ? point.x - width / 2 : point.x, y: point.y), withAttributes: attributes)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bar = NSRect(x: inset, y: 30, width: bounds.width - 2 * inset, height: 20)
+        let line = x(threshold)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: bar, xRadius: 6, yRadius: 6).addClip()
+        leftColor.withAlphaComponent(0.5).setFill()
+        NSRect(x: bar.minX, y: bar.minY, width: line - bar.minX, height: bar.height).fill()
+        rightColor.withAlphaComponent(0.5).setFill()
+        NSRect(x: line, y: bar.minY, width: bar.maxX - line, height: bar.height).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        let font: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10.5, weight: .medium)]
+        let leftWidth = (leftText as NSString).size(withAttributes: font).width
+        let rightWidth = (rightText as NSString).size(withAttributes: font).width
+        if line - bar.minX >= leftWidth + 24 { text(leftText, at: NSPoint(x: bar.minX + 8, y: bar.minY + 3), color: .white) }
+        if bar.maxX - line >= rightWidth + 24 { text(rightText, at: NSPoint(x: bar.maxX - rightWidth - 8, y: bar.minY + 3), color: .white) }
+        NSColor.white.setFill()
+        NSRect(x: line - 1.5, y: bar.minY - 6, width: 3, height: bar.height + 12).fill()
+        NSBezierPath(ovalIn: NSRect(x: line - 8, y: bar.midY - 8, width: 16, height: 16)).fill()
+        let dim = NSColor.secondaryLabelColor
+        text(minText, at: NSPoint(x: bar.minX, y: 8), color: dim, size: 10.5)
+        let maxWidth = (maxText as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 10.5, weight: .medium)]).width
+        text(maxText, at: NSPoint(x: bar.maxX - maxWidth, y: 8), color: dim, size: 10.5)
+        for (index, marker) in markers.enumerated() {
+            let center = x(marker.value)
+            marker.color.setFill()
+            let triangle = NSBezierPath()
+            triangle.move(to: NSPoint(x: center - 6, y: bar.maxY + 10))
+            triangle.line(to: NSPoint(x: center + 6, y: bar.maxY + 10))
+            triangle.line(to: NSPoint(x: center, y: bar.maxY + 1))
+            triangle.fill()
+            text("\(marker.label) \(String(format: "%.2f", marker.value))",
+                 at: NSPoint(x: center, y: bar.maxY + 13 + CGFloat(index % 2) * 13), color: marker.color, centered: true)
+        }
+    }
+}
+
+private final class CameraOverlay: NSView {
+    var previewLayer: AVCaptureVideoPreviewLayer?
+    var bodyThreshold: CGFloat = 0.22
+    var faceThreshold: Double = 0.9 { didSet { needsDisplay = true } }
+    var covered = false { didSet { needsDisplay = true } }
+    var debug: CameraDebug? { didSet { needsDisplay = true } }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func label(_ string: String, at point: NSPoint, color: NSColor) {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                                                         .foregroundColor: NSColor.white]
+        let size = (string as NSString).size(withAttributes: attributes)
+        let rect = NSRect(x: point.x, y: point.y, width: size.width + 12, height: size.height + 4)
+        color.withAlphaComponent(0.92).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+        (string as NSString).draw(at: NSPoint(x: rect.minX + 6, y: rect.minY + 2), withAttributes: attributes)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let layer = previewLayer, let debug else { return }
+        if covered {
+            NSColor.black.withAlphaComponent(0.8).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
+            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 30, weight: .heavy),
+                                                             .foregroundColor: NSColor.white.withAlphaComponent(0.85)]
+            let size = ("가려짐" as NSString).size(withAttributes: attributes)
+            ("가려짐" as NSString).draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+                                      withAttributes: attributes)
+        }
+        for face in debug.faces {
+            let rect = layer.layerRectConverted(fromMetadataOutputRect:
+                CGRect(x: face.box.minX, y: 1 - face.box.maxY, width: face.box.width, height: face.box.height))
+            let ownerNow = face.distance.map { Double($0) <= faceThreshold }
+            let color: NSColor = ownerNow == nil ? .systemGray : ownerNow! ? .systemGreen :
+                face.facing ? .systemRed : .systemOrange
+            color.setStroke()
+            let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+            path.lineWidth = 3
+            path.stroke()
+            let look = face.facing ? "화면 봄" : "딴 곳 봄"
+            let name = ownerNow == nil ? "얼굴 · \(look)" : ownerNow! ? "나로 인정 · \(look)" :
+                face.facing ? "다른 사람 · 화면 봄 → 가림" : "다른 사람 · 딴 곳 봄"
+            let suffix = face.distance.map { String(format: " %.2f", $0) } ?? ""
+            label(name + suffix, at: NSPoint(x: rect.minX, y: rect.maxY + 4), color: color)
+        }
+        for body in debug.bodies {
+            // 얼굴 상자와 같은 변환을 써서 점 위치를 맞춘다.
+            func point(_ p: CGPoint) -> CGPoint {
+                layer.layerRectConverted(fromMetadataOutputRect: CGRect(x: p.x, y: 1 - p.y, width: 0, height: 0)).origin
+            }
+            let a = point(body.left), b = point(body.right)
+            let color: NSColor = body.owner ? .systemGreen : body.span >= bodyThreshold ? .systemRed : .systemYellow
+            color.setStroke()
+            let path = NSBezierPath()
+            path.move(to: a); path.line(to: b)
+            path.lineWidth = 5
+            path.lineCapStyle = .round
+            path.stroke()
+            color.setFill()
+            for end in [a, b] { NSBezierPath(ovalIn: NSRect(x: end.x - 6, y: end.y - 6, width: 12, height: 12)).fill() }
+            let near = body.span >= bodyThreshold
+            let name = body.owner ? "어깨선 · 본인 몸" : near ? "어깨선 · 다른 사람 · 가까움 → 가림" : "어깨선 · 다른 사람 · 멀리 있음"
+            label(String(format: "%@ %.2f", name, body.span), at: NSPoint(x: (a.x + b.x) / 2 - 34, y: min(a.y, b.y) - 24), color: color)
+        }
+    }
+}
+
+// 카메라가 실제로 보는 것과 판별 기준을 한 화면에서 보며 조절하는 창.
+private final class CameraPreviewPanel: NSPanel, NSWindowDelegate {
+    private let camera: CameraGuard
+    private let previewLayer: AVCaptureVideoPreviewLayer
+    private let overlay = CameraOverlay()
+    private let status = NSTextField(labelWithString: "")
+    private let faceMeter: ThresholdMeter
+    private let bodyMeter: ThresholdMeter
+    private var timer: Timer?
+    private var startedCamera = false
+    private var lastDebug: CameraDebug?
+    private let faceTitle = NSTextField(labelWithString: "")
+    private let bodyTitle = NSTextField(labelWithString: "")
+    var onClose: (() -> Void)?
+
+    init(camera: CameraGuard) {
+        self.camera = camera
+        previewLayer = AVCaptureVideoPreviewLayer(session: camera.captureSession)
+        faceMeter = ThresholdMeter(frame: NSRect(x: 20, y: 0, width: 480, height: 96), range: 0.25...1.25,
+                                   limits: 0.25...1.25, threshold: Double(ownerTolerance()),
+                                   left: ("← 나 · 안 가림", .systemGreen), right: ("남 · 가림 →", .systemRed),
+                                   ends: ("0.25 · 가장 까다롭게", "1.25 · 가장 너그럽게"))
+        bodyMeter = ThresholdMeter(frame: NSRect(x: 20, y: 0, width: 480, height: 96), range: 0.14...0.4,
+                                   limits: 0.14...0.4, threshold: Double(bodyProximityThreshold()),
+                                   left: ("← 멀리 · 안 가림", .systemGray), right: ("가까이 · 가림 →", .systemRed),
+                                   ends: ("0.14 · 멀리 있어도 가림", "0.40 · 바짝 와야 가림"))
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 520, height: 700),
+                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        title = "카메라 트래킹 미리보기"
+        level = .floating
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        delegate = self
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 700))
+        func caption(_ head: NSTextField, _ detail: String, y: CGFloat) {
+            head.font = .systemFont(ofSize: 13, weight: .bold)
+            head.frame = NSRect(x: 20, y: y + 17, width: 480, height: 18)
+            let body = NSTextField(labelWithString: detail)
+            body.font = .systemFont(ofSize: 11.5)
+            body.textColor = .secondaryLabelColor
+            body.frame = NSRect(x: 20, y: y, width: 480, height: 16)
+            content.addSubview(head)
+            content.addSubview(body)
+        }
+        var y: CGFloat = 12
+        bodyMeter.frame.origin.y = y; content.addSubview(bodyMeter); y += 96
+        caption(bodyTitle, "오른쪽 = 아주 가까워야 가림 · 왼쪽 = 멀리 있어도 가림", y: y); y += 40
+        faceMeter.frame.origin.y = y; content.addSubview(faceMeter); y += 96
+        caption(faceTitle, "오른쪽 = 너그럽게(웬만하면 나로 인정) · 왼쪽 = 까다롭게(낯선 얼굴을 잘 가림)", y: y); y += 42
+        let legend = NSTextField(wrappingLabelWithString: "네모 = 얼굴 인식 · 선 = 어깨선(몸 감지) · 초록 = 본인\n빨강 = 가림 대상 · 주황 = 딴 곳 보는 다른 사람 · 노랑 = 멀리 있는 몸")
+        legend.font = .systemFont(ofSize: 11)
+        legend.textColor = .secondaryLabelColor
+        legend.frame = NSRect(x: 20, y: y, width: 480, height: 32)
+        content.addSubview(legend)
+        y += 38
+        refreshTitles()
+        let preview = NSView(frame: NSRect(x: 20, y: y, width: 480, height: 290))
+        preview.wantsLayer = true
+        preview.layer?.backgroundColor = NSColor.black.cgColor
+        preview.layer?.cornerRadius = 10
+        preview.layer?.masksToBounds = true
+        previewLayer.videoGravity = .resizeAspect
+        previewLayer.frame = preview.bounds
+        preview.layer?.addSublayer(previewLayer)
+        content.addSubview(preview)
+        overlay.frame = preview.frame
+        overlay.previewLayer = previewLayer
+        content.addSubview(overlay)
+        y += 298
+        status.font = .systemFont(ofSize: 14, weight: .bold)
+        status.frame = NSRect(x: 20, y: y, width: 480, height: 22)
+        content.addSubview(status)
+        y += 34
+        content.frame.size.height = y
+        contentView = content
+        setContentSize(NSSize(width: 520, height: y))
+
+        overlay.bodyThreshold = CGFloat(bodyMeter.threshold)
+        overlay.faceThreshold = faceMeter.threshold
+        faceMeter.onChange = { [weak self] in
+            UserDefaults.standard.set($0, forKey: "ownerTolerance")
+            self?.overlay.faceThreshold = $0
+            self?.refreshTitles()
+            self?.refreshLive()
+        }
+        bodyMeter.onChange = { [weak self] in
+            UserDefaults.standard.set($0, forKey: "bodyProximityThreshold")
+            self?.overlay.bodyThreshold = CGFloat($0)
+            self?.refreshTitles()
+            self?.refreshLive()
+        }
+    }
+
+    func present() {
+        startedCamera = !camera.isEnabled
+        if startedCamera { camera.start() }
+        camera.onDebug = { [weak self] in self?.update($0) }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.mirrorPreview()
+            guard let self, self.overlay.debug == nil else { return }
+            self.show(self.camera.status, .secondaryLabelColor)
+        }
+        center()
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+    }
+
+    private func refreshTitles() {
+        faceTitle.stringValue = String(format: "① 본인 인식 기준 · 현재 %.2f", faceMeter.threshold)
+        bodyTitle.stringValue = String(format: "② 다가옴 감지 거리 · 현재 %.2f", bodyMeter.threshold)
+    }
+
+    // 거울처럼 좌우를 뒤집어 보여준다. 연결은 카메라가 시작된 뒤에 생기므로 매번 확인한다.
+    private func mirrorPreview() {
+        guard let connection = previewLayer.connection, connection.isVideoMirroringSupported,
+              !connection.isVideoMirrored || connection.automaticallyAdjustsVideoMirroring else { return }
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = true
+    }
+
+    private func show(_ text: String, _ color: NSColor) {
+        status.stringValue = "● " + text
+        status.textColor = color
+    }
+
+    // 기준선을 끄는 즉시 마지막 프레임을 새 기준으로 다시 판정해 보여준다.
+    private func refreshLive() { if let lastDebug { update(lastDebug) } }
+
+    private func update(_ debug: CameraDebug) {
+        lastDebug = debug
+        mirrorPreview()
+        overlay.debug = debug
+        let verdict = debug.verdict(face: faceMeter.threshold, body: bodyMeter.threshold)
+        overlay.covered = verdict.hidden
+        faceMeter.markers = debug.faces.compactMap { face in
+            face.distance.map { distance in
+                let mine = Double(distance) <= faceMeter.threshold
+                return (Double(distance), mine ? NSColor.systemGreen : NSColor.systemRed, mine ? "나" : "타인")
+            }
+        }
+        bodyMeter.markers = debug.bodies.map { (Double($0.span), $0.owner ? NSColor.systemGreen : Double($0.span) >= Double(overlay.bodyThreshold) ? NSColor.systemRed : NSColor.systemYellow, $0.owner ? "본인" : "타인") }
+        if !camera.hasOwner { show("본인이 등록되지 않았습니다 — ◐ → 카메라 트래킹 → 나로 지정…", .systemOrange) }
+        else if verdict.hidden { show("가려짐 — " + verdict.reason, .systemRed) }
+        else if debug.faces.isEmpty { show("얼굴이 보이지 않습니다", .secondaryLabelColor) }
+        else if debug.faces.contains(where: { !$0.owner && ($0.distance.map { Double($0) <= faceMeter.threshold } ?? false) }) {
+            show("안 가려짐 — 다른 얼굴도 '나'로 인정됨 → 선을 왼쪽으로", .systemOrange)
+        } else { show("안 가려짐 — 본인만 보입니다", .systemGreen) }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        camera.onDebug = nil
+        if startedCamera { camera.stop() }
+        onClose?()
     }
 }
 
@@ -1086,6 +1434,7 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var selected: Mask?
     private var colorTarget: Mask?
     private let cameraGuard = CameraGuard()
+    private var cameraPreview: CameraPreviewPanel?
     private var cameraBoost: CGFloat = 0
     private var hidden = false
     private var timer: Timer?
@@ -1259,9 +1608,10 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cameraMenu.addItem(toggleCamera)
         cameraMenu.addItem(disabledLabel(cameraGuard.status))
         cameraMenu.addItem(disabledLabel("반응할 가리개 \(masks.filter(\.cameraTrackingEnabled).count)개"))
-        cameraMenu.addItem(disabledLabel("본인 판별 기준 · 낮을수록 엄격"))
+        cameraMenu.addItem(item("미리보기로 보며 조절…", #selector(openCameraPreview)))
+        cameraMenu.addItem(disabledLabel("① 본인 인식 기준 · 왼쪽=엄격"))
         cameraMenu.addItem(sliderItem(Double(ownerTolerance()), 0.55, 1.25, 0, #selector(changeOwnerTolerance(_:))))
-        cameraMenu.addItem(disabledLabel("몸 감지 거리 · 왼쪽일수록 멀리"))
+        cameraMenu.addItem(disabledLabel("② 다가옴 감지 거리 · 왼쪽=멀리서 반응"))
         cameraMenu.addItem(sliderItem(Double(bodyProximityThreshold()), 0.14, 0.4, 0, #selector(changeBodyProximity(_:))))
         cameraMenu.addItem(.separator())
         cameraMenu.addItem(item(cameraGuard.hasOwner ? "나로 다시 지정…" : "나로 지정…", #selector(enrollOwner)))
@@ -1571,6 +1921,17 @@ private final class ShadeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func changeSpotlightRadius(_ slider: NSSlider) {
         masks[slider.tag].spotlightRadius = CGFloat(slider.doubleValue)
     }
+    @objc private func openCameraPreview() {
+        if let panel = cameraPreview {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+        let panel = CameraPreviewPanel(camera: cameraGuard)
+        panel.onClose = { [weak self] in self?.cameraPreview = nil }
+        cameraPreview = panel
+        panel.present()
+    }
     @objc private func toggleCameraTracking() {
         if cameraGuard.isEnabled { cameraGuard.stop() } else { cameraGuard.start() }
     }
@@ -1698,6 +2059,9 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(facesScreen(yaw: 0.1, pitch: 0.2, bothEyesVisible: true))
     precondition(!facesScreen(yaw: 0.9, pitch: 0, bothEyesVisible: true))
     precondition(!facesScreen(yaw: nil, pitch: nil, bothEyesVisible: false))
+    let meter = ThresholdMeter(frame: NSRect(x: 0, y: 0, width: 528, height: 96), range: 0...1, limits: 0.2...0.8,
+                               threshold: 0.5, left: ("", .green), right: ("", .red), ends: ("", ""))
+    precondition(abs(meter.value(atX: 264) - 0.5) < 0.001 && meter.value(atX: 0) == 0.2 && meter.value(atX: 600) == 0.8)
     precondition(!facesScreen(yaw: 0.8, pitch: 0, bothEyesVisible: true))
     precondition(facesScreen(yaw: 0.8, pitch: 0, bothEyesVisible: true, limit: 0.95))
     let ob = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
@@ -1827,4 +2191,18 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
