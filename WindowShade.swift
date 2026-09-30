@@ -232,15 +232,18 @@ private struct HandHold {
     }
 }
 
-// 내 손 판정: 이번 프레임에 내 얼굴이 보이고, 손이 내 얼굴 가까이에 있으며,
-// 손 크기가 내 얼굴에 비해 충분히 커야(=나와 같은 거리 이내) 하고, 다른 사람 얼굴보다 내 얼굴에 더 가까워야 한다.
-// size는 손목~가운뎃손가락 뿌리 길이(화면 너비 기준). 뒤에 있는 사람의 손은 작게 찍혀 걸러진다.
-private func isOwnerHand(wrist: CGPoint, size: CGFloat, owner: CGRect?, others: [CGRect]) -> Bool {
+// 내 손 판정: 손목이 내 몸 뼈대(내 얼굴에 붙은 자세)의 손목과 겹쳐야 한다.
+// 내 팔에 이어진 손만 인정하므로 옆·뒤 사람 손은 얼굴이 안 보여도 걸러진다.
+// 좌표는 가로 기준 길이로 맞춘 값(y에 aspect를 나눈 값)을 쓴다.
+private func isOwnerHand(wrist: CGPoint, size: CGFloat, owner: CGRect?,
+                         ownerWrists: [CGPoint], otherWrists: [CGPoint], otherFaces: [CGRect]) -> Bool {
     guard let owner, owner.width > 0.01, size >= owner.width * 0.4 else { return false }
-    let dx = abs(wrist.x - owner.midX) / owner.width
-    guard dx <= 2.5, wrist.y <= owner.maxY + owner.height * 1.5 else { return false }
-    let mine = hypot(wrist.x - owner.midX, wrist.y - owner.midY) / owner.width
-    return !others.contains { hypot(wrist.x - $0.midX, wrist.y - $0.midY) / max($0.width, 0.01) < mine }
+    func gap(_ p: CGPoint) -> CGFloat { hypot(p.x - wrist.x, p.y - wrist.y) }
+    guard let mine = ownerWrists.map(gap).min(), mine <= owner.width * 0.9 else { return false }
+    if otherWrists.contains(where: { gap($0) < mine }) { return false }
+    // 다른 사람 얼굴이 내 얼굴보다 이 손에 더 가까우면 그 사람 손으로 본다.
+    let toMe = hypot(wrist.x - owner.midX, wrist.y - owner.midY) / owner.width
+    return !otherFaces.contains { hypot(wrist.x - $0.midX, wrist.y - $0.midY) / max($0.width, 0.01) < toMe }
 }
 
 private func isOpenHand(_ fingers: [(tip: CGFloat, base: CGFloat)]) -> Bool {
@@ -874,7 +877,7 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let handRequest = VNDetectHumanHandPoseRequest()
         handRequest.maximumHandCount = 2
         var requests: [VNRequest] = analyzeBodies ? [bodyRequest, humanRequest] : []
-        if gestureOn { requests.append(handRequest) }
+        if gestureOn { requests.append(handRequest); if !analyzeBodies { requests.append(bodyRequest) } }
         if !requests.isEmpty,
            (try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform(requests)) == nil { return }
         if analyzeBodies {
@@ -1048,6 +1051,26 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
         if gestureOn {
             // 가로:세로 비율. 세로 좌표를 가로 기준 길이로 맞춘다.
             let aspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(1, CVPixelBufferGetHeight(pixelBuffer)))
+            func flat(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x, y: p.y / aspect) }
+            let ownerFace = ownerIndex.map { faces[$0].boundingBox }
+            let poses = bodyRequest.results ?? []
+            func joint(_ pose: VNHumanBodyPoseObservation, _ name: VNHumanBodyPoseObservation.JointName) -> CGPoint? {
+                guard let p = try? pose.recognizedPoint(name), p.confidence >= 0.2 else { return nil }
+                return p.location
+            }
+            // 코나 목이 내 얼굴 상자 안에 있는 자세가 내 몸이다.
+            let ownerPoseIndex = ownerFace.flatMap { face in
+                poses.indices.first { i in
+                    [joint(poses[i], .nose), joint(poses[i], .neck)].compactMap { $0 }
+                        .contains { face.insetBy(dx: -face.width * 0.25, dy: -face.height * 0.6).contains($0) }
+                }
+            }
+            func wrists(_ pose: VNHumanBodyPoseObservation) -> [CGPoint] {
+                [joint(pose, .leftWrist), joint(pose, .rightWrist)].compactMap { $0.map(flat) }
+            }
+            let ownerWrists = ownerPoseIndex.map { wrists(poses[$0]) } ?? []
+            let otherWrists = poses.indices.filter { $0 != ownerPoseIndex }.flatMap { wrists(poses[$0]) }
+            func flatBox(_ b: CGRect) -> CGRect { CGRect(x: b.minX, y: b.minY / aspect, width: b.width, height: b.height / aspect) }
             let tips: [VNHumanHandPoseObservation.JointName] = [.indexTip, .middleTip, .ringTip, .littleTip]
             let bases: [VNHumanHandPoseObservation.JointName] = [.indexMCP, .middleMCP, .ringMCP, .littleMCP]
             for hand in handRequest.results ?? [] {
@@ -1061,8 +1084,9 @@ private final class CameraGuard: NSObject, AVCaptureVideoDataOutputSampleBufferD
                 }
                 guard let knuckle = try? hand.recognizedPoint(.middleMCP), knuckle.confidence >= 0.3 else { continue }
                 let size = hypot(knuckle.location.x - wrist.location.x, (knuckle.location.y - wrist.location.y) / aspect)
-                let mine = isOwnerHand(wrist: wrist.location, size: size, owner: ownerIndex.map { faces[$0].boundingBox },
-                                       others: faces.indices.filter { $0 != ownerIndex }.map { faces[$0].boundingBox })
+                let mine = isOwnerHand(wrist: flat(wrist.location), size: size, owner: ownerFace.map(flatBox),
+                                       ownerWrists: ownerWrists, otherWrists: otherWrists,
+                                       otherFaces: faces.indices.filter { $0 != ownerIndex }.map { flatBox(faces[$0].boundingBox) })
                 let state: Bool? = fingers.count < 3 ? nil : isFist(fingers) ? true : isOpenHand(fingers) ? false : nil
                 hands.append(.init(point: wrist.location, fist: state, mine: mine))
             }
@@ -2255,11 +2279,14 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!brief.update(fist: true, now: 0) && !brief.update(fist: false, now: 0.45) && !brief.update(fist: true, now: 0.9))
     let me = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.25)
     let back = CGRect(x: 0.75, y: 0.6, width: 0.06, height: 0.08)
-    precondition(isOwnerHand(wrist: CGPoint(x: 0.3, y: 0.45), size: 0.12, owner: me, others: [back]))
-    precondition(!isOwnerHand(wrist: CGPoint(x: 0.3, y: 0.45), size: 0.12, owner: nil, others: []))
-    precondition(!isOwnerHand(wrist: CGPoint(x: 0.5, y: 0.5), size: 0.04, owner: me, others: []))
-    precondition(!isOwnerHand(wrist: CGPoint(x: 0.78, y: 0.58), size: 0.09, owner: me, others: [back]))
-    precondition(!isOwnerHand(wrist: CGPoint(x: 0.99, y: 0.45), size: 0.12, owner: CGRect(x: 0.2, y: 0.4, width: 0.1, height: 0.12), others: []))
+    let hw = CGPoint(x: 0.3, y: 0.45)
+    precondition(isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.32, y: 0.43)], otherWrists: [], otherFaces: [back]))
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: nil, ownerWrists: [hw], otherWrists: [], otherFaces: []))
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [], otherWrists: [], otherFaces: []))
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.7, y: 0.3)], otherWrists: [], otherFaces: []))
+    precondition(!isOwnerHand(wrist: hw, size: 0.12, owner: me, ownerWrists: [CGPoint(x: 0.4, y: 0.45)], otherWrists: [CGPoint(x: 0.31, y: 0.45)], otherFaces: []))
+    precondition(!isOwnerHand(wrist: hw, size: 0.04, owner: me, ownerWrists: [hw], otherWrists: [], otherFaces: []))
+    precondition(!isOwnerHand(wrist: CGPoint(x: 0.78, y: 0.58), size: 0.09, owner: me, ownerWrists: [CGPoint(x: 0.7, y: 0.55)], otherWrists: [], otherFaces: [back]))
     precondition(sameFace(CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2), CGRect(x: 0.12, y: 0.12, width: 0.2, height: 0.2)))
     precondition(!sameFace(CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1), CGRect(x: 0.5, y: 0.5, width: 0.1, height: 0.1)))
     var watch = VisitorWatch()
@@ -2383,6 +2410,7 @@ if CommandLine.arguments.contains("--self-test") {
     app.setActivationPolicy(.accessory)
     app.run()
 }
+
 
 
 
